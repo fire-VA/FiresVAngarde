@@ -1,0 +1,10 @@
+{
+    "name":  "FiresVAngarde",
+    "version_number":  "0.2.35",
+    "website_url":  "https://github.com/fire-VA/FiresVAngarde",
+    "description":  "Server guardian: enforces the server mod list with a clear mismatch panel, watches for cheats, and keeps characters server-owned with rotating backups.",
+    "dependencies":  [
+                         "denikson-BepInExPack_Valheim-5.4.2350",
+                         "VerdantsAscent-FiresUnifiedCore-0.2.219"
+                     ]
+}
