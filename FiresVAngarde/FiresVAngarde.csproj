@@ -178,6 +178,7 @@
     <Compile Include="Modules\Characters\CharactersClient.cs" />
     <Compile Include="Modules\Characters\CharactersEnforcement.cs" />
     <Compile Include="Modules\Characters\CharactersEmergencyBackup.cs" />
+    <Compile Include="Modules\Characters\CharactersShutdownPull.cs" />
     <Compile Include="Modules\Characters\CharactersPlayerTemplate.cs" />
     <Compile Include="Utilities\FiresLogger.cs" />
     <Compile Include="Utilities\FiresVAngardeBanner.cs" />

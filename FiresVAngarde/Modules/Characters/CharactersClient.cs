@@ -200,6 +200,10 @@ namespace VerdantsAscent.Modules.Characters
             IsServerCharacter = false;
             s_uploadsSent = s_uploadsSettled = 0;
             s_uploadConfirmed = s_quitPending = s_earlyQuitLogged = false;
+            // A new session: the last one's unclean-disconnect flag and key are spent (its sidecars go out below). 0.2.36
+            CharactersEmergencyBackup.ClearClientState();
+            // The server asks for a save when it shuts down with players online (0.2.36, CharactersShutdownPull).
+            peer.m_rpc.Register(CharactersShutdownPull.RpcSaveNow, OnServerAsksSave);
             if (!s_quitHookAdded)
             {
                 s_quitHookAdded = true;
@@ -292,6 +296,18 @@ namespace VerdantsAscent.Modules.Characters
             }
         }
 
+        // The server is shutting down with us online (0.2.36): save now, which uploads through the postfix below.
+        private static void OnServerAsksSave(ZRpc rpc)
+        {
+            try
+            {
+                if (!Active || !IsServerCharacter || Game.instance == null || Player.m_localPlayer == null || Game.instance.IsShuttingDown()) return;
+                Debug.Log("[Characters] the server is shutting down: saving the character now");
+                Game.instance.SavePlayerProfile(false);
+            }
+            catch (Exception ex) { Debug.LogWarning($"[Characters] the shutdown save failed: {ex.Message}"); }
+        }
+
         [HarmonyPatch(typeof(PlayerProfile), nameof(PlayerProfile.SavePlayerToDisk))]
         [HarmonyPostfix]
         private static void SavePlayerToDisk_Postfix(PlayerProfile __instance)
@@ -300,15 +316,20 @@ namespace VerdantsAscent.Modules.Characters
             ZNet znet = ZNet.instance;
             if (znet == null || znet.IsServer()) return;
 
-            ZNetPeer server = znet.GetServerPeer();
-            if (server == null || !server.IsReady()) return;
-
             try
             {
                 // Re-serialize the just-saved file via a throwaway profile (no mutation of the active one).
                 byte[] bytes = new PlayerProfile(__instance.m_filename, __instance.m_fileSource)
                     .LoadPlayerDataFromDisk()?.GetArray();
                 if (bytes == null || bytes.Length == 0) return;
+
+                // After an unclean disconnect (the server stopped, the link dropped), the signed backup the server restores at the
+                // next login. Before the server check (0.2.36, R90 runs 2/3): with the server gone there is no peer, and that is
+                // exactly when it's needed; it used to sit after the check and was never written. Counts the uploads already sent.
+                CharactersEmergencyBackup.TryWriteSidecars(__instance, bytes, s_uploadsSent);
+
+                ZNetPeer server = znet.GetServerPeer();
+                if (server == null || !server.IsReady()) return;
                 // The logout's own save repeats the one the hold just had confirmed; sent now it would only be cut off. While the hold
                 // waits on its upload, any other save (a last-resort one at an early OnApplicationQuit, FGN's) stays on disk.
                 if (!s_uploadConfirmed && !(s_holdingFor != null && s_holdUploaded))
@@ -316,11 +337,6 @@ namespace VerdantsAscent.Modules.Characters
                     CharacterProfileTransport.SendToPeer(server, CharactersServer.RpcSave, bytes, null);
                     s_uploadsSent++;
                 }
-
-                // If this save was triggered by an unclean shutdown / connection loss, also write
-                // the signed sidecar backup. Cleared automatically on the next save if conditions
-                // are no longer met (i.e. cleanly reconnected).
-                CharactersEmergencyBackup.TryWriteSidecars(__instance, bytes);
             }
             catch (Exception ex)
             {

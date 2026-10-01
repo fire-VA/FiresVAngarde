@@ -17,6 +17,7 @@ namespace VerdantsAscent.Modules.Characters
         public static ConfigEntry<int> ConfigCrossplayInFlightBytes;
         public static ConfigEntry<float> ConfigNoProgressTimeoutSeconds;
         public static ConfigEntry<float> ConfigLogoutSaveWaitSeconds;
+        public static ConfigEntry<float> ConfigShutdownSaveWaitSeconds;
         public static ConfigEntry<int> ConfigBackupsToKeep;
 
         // Enforcement
@@ -38,6 +39,7 @@ namespace VerdantsAscent.Modules.Characters
         public static int CrossplayInFlightBytes => ConfigCrossplayInFlightBytes?.Value ?? (64 * 1024);
         public static float NoProgressTimeoutSeconds => ConfigNoProgressTimeoutSeconds?.Value ?? 120f;
         public static float LogoutSaveWaitSeconds => ConfigLogoutSaveWaitSeconds?.Value ?? 15f;
+        public static float ShutdownSaveWaitSeconds => ConfigShutdownSaveWaitSeconds?.Value ?? 6f;
         public static int BackupsToKeep => ConfigBackupsToKeep?.Value ?? 25;
 
         public static void Initialize(ConfigFile config)
@@ -80,6 +82,13 @@ namespace VerdantsAscent.Modules.Characters
                     "character. A crossplay (PlayFab) link drops whatever is still queued when it closes, so without the wait " +
                     "the logout's save never arrives. The logout goes ahead at once if the connection is lost.",
                     new AcceptableValueRange<float>(2f, 60f)));
+
+            ConfigShutdownSaveWaitSeconds = config.Bind("Characters.Transport", "ShutdownSaveWaitSeconds", 6f,
+                new ConfigDescription(
+                    "When the server shuts down with players online, it asks each of them to save their character now and waits up " +
+                    "to this many seconds for the saves to arrive. 0 turns it off. A player whose save doesn't make it in time keeps " +
+                    "a signed backup on their machine that the server restores at their next login.",
+                    new AcceptableValueRange<float>(0f, 30f)));
 
             ConfigBackupsToKeep = config.Bind("Characters", "BackupsToKeep", 25,
                 new ConfigDescription("Rotating profile backups to keep per character (ZIP in the backups folder).",

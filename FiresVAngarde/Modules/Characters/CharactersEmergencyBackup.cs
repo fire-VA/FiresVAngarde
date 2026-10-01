@@ -20,8 +20,14 @@ namespace VerdantsAscent.Modules.Characters
     ///   AES_encrypt(SHA512(profileBytes), key, IV), IV, time }</c>. On reconnect the client ships
     ///   both files to the server, which derives the same key from the embedded <c>time</c> using
     ///   its master key, decrypts the SHA512, compares against the recomputed hash of the backup
-    ///   bytes, and only restores when (signature valid) AND (time &gt; current .fch's last-write).
-    ///   The time gate is the actual rollback guard: stale signatures can't overwrite newer state.
+    ///   bytes, and only restores when (signature valid) AND the backup is newer than what the server holds.
+    ///
+    /// • Newer (0.2.36, R90 runs 2/3: a server stopped with players online lost their whole session): the signature also carries
+    ///   how many uploads the client had SENT in that session, hashed in with the profile. For every upload it accepts, the server
+    ///   keeps <c>&lt;file&gt;.fch.session</c> = { the session's key time, uploads accepted in it }. A backup restores when it comes
+    ///   from a later session, or from the same session with at least as many uploads sent as the server took: it was written after
+    ///   all of them. Only the server's clock is involved. A signature without the count (an older client) or a character without
+    ///   the session file falls back to the first rule: key time later than the .fch's last write.
     /// </summary>
     public static class CharactersEmergencyBackup
     {
@@ -33,7 +39,49 @@ namespace VerdantsAscent.Modules.Characters
         private static long   _clientKeyTime; // matching server timestamp
         private static bool   _emergencyBackupPending;
 
+        // Server: the key time sent to each connection this session, so an accepted upload can be tied to its session.
+        private static readonly System.Collections.Generic.Dictionary<ZRpc, long> s_peerKeyTime =
+            new System.Collections.Generic.Dictionary<ZRpc, long>();
+
         // ── Server ───────────────────────────────────────────────────────────────────────────
+
+        /// <summary>Server: the key time this connection was given this session (0 when none was sent).</summary>
+        internal static long PeerKeyTime(ZRpc rpc) => rpc != null && s_peerKeyTime.TryGetValue(rpc, out long time) ? time : 0L;
+
+        /// <summary>
+        /// Server: an upload made in the session keyed <paramref name="keyTime"/> was saved for <paramref name="steamId"/>/
+        /// <paramref name="charName"/>. Counts it in that character's session file (key time, uploads accepted in it), the restore
+        /// gate's other half.
+        /// </summary>
+        internal static void NoteAcceptedUpload(long keyTime, string steamId, string charName)
+        {
+            if (keyTime == 0L || string.IsNullOrEmpty(steamId) || string.IsNullOrEmpty(charName)) return;
+            try
+            {
+                string path = SessionPath(steamId, charName);
+                ReadSession(path, out long knownTime, out int accepted);
+                accepted = knownTime == keyTime ? accepted + 1 : 1;
+                File.WriteAllText(path, $"{keyTime} {accepted}");
+            }
+            catch (Exception ex) { Debug.LogWarning($"[Characters] emergency-backup: couldn't note the upload for {steamId}/{charName}: {ex.Message}"); }
+        }
+
+        internal static void ForgetPeer(ZRpc rpc)
+        {
+            if (rpc != null) s_peerKeyTime.Remove(rpc);
+        }
+
+        private static string SessionPath(string steamId, string charName) =>
+            CharacterStore.SaveDir + CharacterStore.FileName(steamId, charName) + ".fch.session";
+
+        private static bool ReadSession(string path, out long keyTime, out int accepted)
+        {
+            keyTime = 0L;
+            accepted = 0;
+            if (!File.Exists(path)) return false;
+            string[] parts = File.ReadAllText(path).Trim().Split(' ');
+            return parts.Length == 2 && long.TryParse(parts[0], out keyTime) && int.TryParse(parts[1], out accepted);
+        }
 
         public static void EnsureServerKey()
         {
@@ -58,6 +106,7 @@ namespace VerdantsAscent.Modules.Characters
                 pkg.Write(key);
                 pkg.Write(time);
                 peer.m_rpc.Invoke(RpcKeyExchange, pkg);
+                s_peerKeyTime[peer.m_rpc] = time;
             }
             catch (Exception ex) { Debug.LogWarning($"[Characters] SendKeyToPeer failed: {ex.Message}"); }
         }
@@ -70,7 +119,7 @@ namespace VerdantsAscent.Modules.Characters
                 byte[] profileBytes = outerPkg.ReadByteArray();
                 byte[] signatureZpkg = outerPkg.ReadByteArray();
 
-                long time = VerifySignature(profileBytes, signatureZpkg);
+                long time = VerifySignature(profileBytes, signatureZpkg, out int sentCount, out bool counted);
                 if (time <= 0L)
                 {
                     Debug.Log($"[Characters] emergency-backup: invalid signature from {rpc.m_socket?.GetHostName()} — skipping.");
@@ -98,14 +147,34 @@ namespace VerdantsAscent.Modules.Characters
                     return;
                 }
 
-                if (new DateTime(time) <= fi.LastWriteTime)
+                string newer;
+                if (counted && ReadSession(SessionPath(steamId, charName), out long lastSession, out int accepted))
                 {
-                    Debug.Log($"[Characters] emergency-backup: signature is stale (sig {new DateTime(time):o} <= current {fi.LastWriteTime:o}) — skipping.");
-                    return;
+                    // 0.2.36: by session and upload count, on the server's clock only.
+                    if (time < lastSession)
+                    {
+                        Debug.Log($"[Characters] emergency-backup: {steamId}/{charName}'s backup is from an earlier session than its last save — skipping.");
+                        return;
+                    }
+                    if (time == lastSession && sentCount < accepted)
+                    {
+                        Debug.Log($"[Characters] emergency-backup: {steamId}/{charName}'s backup is older than the last save of that session (sent {sentCount}, the server took {accepted}) — skipping.");
+                        return;
+                    }
+                    newer = time > lastSession ? "a later session than its last save" : $"after the last save of that session (sent {sentCount}, the server took {accepted})";
+                }
+                else
+                {
+                    if (new DateTime(time) <= fi.LastWriteTime)
+                    {
+                        Debug.Log($"[Characters] emergency-backup: signature is stale (sig {new DateTime(time):o} <= current {fi.LastWriteTime:o}) — skipping.");
+                        return;
+                    }
+                    newer = "its session started after the last save";
                 }
 
                 if (CharacterStore.SaveProfileBytes(steamId, charName, profileBytes))
-                    Debug.Log($"[Characters] emergency-backup: RESTORED {steamId}/{charName} from signed backup.");
+                    Debug.Log($"[Characters] emergency-backup: RESTORED {steamId}/{charName} from signed backup ({profileBytes.Length}B; {newer}).");
             }
             catch (Exception ex)
             {
@@ -121,15 +190,24 @@ namespace VerdantsAscent.Modules.Characters
             return derive.GetBytes(32);
         }
 
-        private static long VerifySignature(byte[] profileData, byte[] signatureZpkgBytes)
+        // The key time when the signature is valid (else 0). A 0.2.36 signature also carries the uploads the client had sent that
+        // session (counted = true), hashed in with the profile; an older one hashes the profile alone.
+        private static long VerifySignature(byte[] profileData, byte[] signatureZpkgBytes, out int sentCount, out bool counted)
         {
+            sentCount = 0;
+            counted = false;
             try
             {
-                byte[] expectedHash = SHA512.Create().ComputeHash(profileData);
                 var sigPkg = new ZPackage(signatureZpkgBytes);
                 byte[] encryptedHash = sigPkg.ReadByteArray();
                 byte[] iv = sigPkg.ReadByteArray();
                 long time = sigPkg.ReadLong();
+                if (sigPkg.GetPos() < sigPkg.Size())
+                {
+                    sentCount = sigPkg.ReadInt();
+                    counted = true;
+                }
+                byte[] expectedHash = SHA512.Create().ComputeHash(counted ? WithCount(profileData, sentCount) : profileData);
                 byte[] key = DeriveKey(time);
                 if (key == null) return 0L;
 
@@ -160,7 +238,11 @@ namespace VerdantsAscent.Modules.Characters
 
         public static void ClearClientState() { _clientKey = null; _clientKeyTime = 0L; _emergencyBackupPending = false; }
 
-        public static bool TryWriteSidecars(PlayerProfile profile, byte[] profileBytes)
+        /// <summary>
+        /// Client: after an unclean disconnect, writes the signed backup of <paramref name="profileBytes"/>, counting the
+        /// <paramref name="uploadsSent"/> uploads this session already sent (0.2.36: the server's restore gate).
+        /// </summary>
+        public static bool TryWriteSidecars(PlayerProfile profile, byte[] profileBytes, int uploadsSent)
         {
             if (profile == null || profileBytes == null || profileBytes.Length == 0) return false;
             if (!_emergencyBackupPending || _clientKey == null) return false;
@@ -168,8 +250,8 @@ namespace VerdantsAscent.Modules.Characters
             {
                 string baseFile = SaveSystem.GetCharacterFolderPath(profile.m_fileSource) + profile.m_filename;
                 File.WriteAllBytes(baseFile + ".fch.serverbackup", profileBytes);
-                File.WriteAllBytes(baseFile + ".fch.signature", BuildSignature(profileBytes, _clientKey, _clientKeyTime));
-                Debug.Log($"[Characters] emergency-backup: wrote sidecars for {profile.m_filename}.");
+                File.WriteAllBytes(baseFile + ".fch.signature", BuildSignature(profileBytes, _clientKey, _clientKeyTime, uploadsSent));
+                Debug.Log($"[Characters] emergency-backup: wrote sidecars for {profile.m_filename} ({profileBytes.Length}B, after {uploadsSent} upload(s) this session).");
                 return true;
             }
             catch (Exception ex)
@@ -213,9 +295,17 @@ namespace VerdantsAscent.Modules.Characters
             catch { /* best-effort cleanup */ }
         }
 
-        private static byte[] BuildSignature(byte[] profileBytes, byte[] key, long time)
+        private static byte[] WithCount(byte[] profileBytes, int count)
         {
-            byte[] hash = SHA512.Create().ComputeHash(profileBytes);
+            var data = new byte[profileBytes.Length + 4];
+            Buffer.BlockCopy(profileBytes, 0, data, 0, profileBytes.Length);
+            Buffer.BlockCopy(BitConverter.GetBytes(count), 0, data, profileBytes.Length, 4);
+            return data;
+        }
+
+        private static byte[] BuildSignature(byte[] profileBytes, byte[] key, long time, int uploadsSent)
+        {
+            byte[] hash = SHA512.Create().ComputeHash(WithCount(profileBytes, uploadsSent));
             using var aes = Aes.Create();
             aes.Key = key;
             // Fresh IV every signature.
@@ -227,6 +317,7 @@ namespace VerdantsAscent.Modules.Characters
             pkg.Write(cipher);
             pkg.Write(aes.IV);
             pkg.Write(time);
+            pkg.Write(uploadsSent);
             return pkg.GetArray();
         }
     }

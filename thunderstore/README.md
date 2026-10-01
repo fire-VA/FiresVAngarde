@@ -77,6 +77,9 @@ server..."), for up to `LogoutSaveWaitSeconds`. Quitting the game (the Quit butt
 logs out first, so the save always lands. Crossplay saves travel in smaller pieces, sized by
 `CrossplayChunkSizeBytes` and `CrossplayInFlightBytes`.
 
+When the server shuts down with players online, it asks each of them to save their character first and waits up to
+`ShutdownSaveWaitSeconds` (0 turns it off), so a restart doesn't cost anyone their progress.
+
 `Characters.ServerKey` is generated on first start and signs saves so an older character file cannot be
 rolled back in. Never edit or share it, and keep it when you move the server.
 

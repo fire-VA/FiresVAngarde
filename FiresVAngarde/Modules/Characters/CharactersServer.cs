@@ -141,17 +141,28 @@ namespace VerdantsAscent.Modules.Characters
 
             var timer = System.Diagnostics.Stopwatch.StartNew();
             int length = bytes.Length;
+            // Taken now, while the peer is still connected: the save lands on the disk thread, maybe after a logout disconnect.
+            long sessionKey = CharactersEmergencyBackup.PeerKeyTime(rpc);
             double mainMs = -1d; // set once the call returns; an older-version upload is saved inside it, before that
             bool accepted = CharacterStore.SaveProfileBytesInBackground(steamId, name, bytes, (saved, diskMs) =>
             {
                 double main = mainMs >= 0d ? mainMs : timer.Elapsed.TotalMilliseconds;
                 if (saved)
+                {
                     Debug.Log($"[Characters] saved profile for {steamId}/{name} ({length}B) in {timer.ElapsedMilliseconds} ms: main thread {main:0.0} ms, disk thread {diskMs:0.0} ms (file + backup).");
+                }
                 else
                     Debug.LogWarning($"[Characters] profile for {steamId}/{name} ({length}B) was NOT saved: writing it failed (see above).");
                 Acknowledge(rpc, saved ? length : NotSaved);
             });
             mainMs = timer.Elapsed.TotalMilliseconds;
+            if (accepted)
+            {
+                // Counted when accepted, not in the save's done callback: that one runs on the main-thread dispatcher, which no longer
+                // ticks once the server is shutting down (the shutdown pull's saves), while the write itself completes in the drain.
+                CharactersEmergencyBackup.NoteAcceptedUpload(sessionKey, steamId, name);   // the restore gate's count (0.2.36)
+                CharactersShutdownPull.NoteReceived(rpc, steamId, name, length);
+            }
             if (!accepted)
             {
                 Debug.LogWarning($"[Characters] profile for {steamId}/{name} ({length}B) was NOT saved: it did not load as a player profile.");
@@ -172,6 +183,7 @@ namespace VerdantsAscent.Modules.Characters
         private static void Disconnect_Postfix(ZNetPeer peer)
         {
             if (peer != null) _peerProfile.Remove(peer);
+            if (peer != null) CharactersEmergencyBackup.ForgetPeer(peer.m_rpc);
         }
 
         private static void Flush(BufferingSocket state, ZRpc rpc, ZNetPeer peer)
