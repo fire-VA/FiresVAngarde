@@ -248,7 +248,7 @@ namespace VerdantsAscent.Modules.Characters
             if (!_emergencyBackupPending || _clientKey == null) return false;
             try
             {
-                string baseFile = SaveSystem.GetCharacterFolderPath(profile.m_fileSource) + profile.m_filename;
+                string baseFile = SidecarBase(profile);
                 File.WriteAllBytes(baseFile + ".fch.serverbackup", profileBytes);
                 File.WriteAllBytes(baseFile + ".fch.signature", BuildSignature(profileBytes, _clientKey, _clientKeyTime, uploadsSent));
                 Debug.Log($"[Characters] emergency-backup: wrote sidecars for {profile.m_filename} ({profileBytes.Length}B, after {uploadsSent} upload(s) this session).");
@@ -266,7 +266,7 @@ namespace VerdantsAscent.Modules.Characters
             if (serverPeer?.m_rpc == null || profile == null) return;
             try
             {
-                string baseFile = SaveSystem.GetCharacterFolderPath(profile.m_fileSource) + profile.m_filename;
+                string baseFile = SidecarBase(profile);
                 string sigPath = baseFile + ".fch.signature";
                 string bakPath = baseFile + ".fch.serverbackup";
                 if (!File.Exists(sigPath) || !File.Exists(bakPath)) return;
@@ -288,11 +288,20 @@ namespace VerdantsAscent.Modules.Characters
             if (profile == null) return;
             try
             {
-                string baseFile = SaveSystem.GetCharacterFolderPath(profile.m_fileSource) + profile.m_filename;
+                string baseFile = SidecarBase(profile);
                 foreach (var ext in new[] { ".fch.signature", ".fch.serverbackup" })
                     if (File.Exists(baseFile + ext)) File.Delete(baseFile + ext);
             }
             catch { /* best-effort cleanup */ }
+        }
+
+        // Client: the sidecars live in the LOCAL character folder whatever the profile's own file source (0.2.37, run 7: the server-held
+        // profile a client adopts resolved to "\characters\", so "C:\characters\coop1.fch.serverbackup" failed and the backup never existed).
+        private static string SidecarBase(PlayerProfile profile)
+        {
+            string folder = SaveSystem.GetCharacterFolderPath(FileHelpers.FileSource.Local);
+            Directory.CreateDirectory(folder);
+            return folder + profile.m_filename;
         }
 
         private static byte[] WithCount(byte[] profileBytes, int count)

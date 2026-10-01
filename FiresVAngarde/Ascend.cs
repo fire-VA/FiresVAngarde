@@ -22,7 +22,7 @@ namespace VerdantsAscent
     {
         public const string PluginGUID = "com.Fire.FiresVAngarde";
         public const string PluginName = "FiresVAngarde";
-        public const string PluginVersion = "0.2.36";
+        public const string PluginVersion = "0.2.37";
 
         public static FiresVAngarde Instance { get; private set; }
         public static readonly Harmony harmony = new(PluginGUID);
