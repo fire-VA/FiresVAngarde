@@ -32,8 +32,17 @@ namespace VerdantsAscent.Modules.Characters
     public static class CharactersEmergencyBackup
     {
         internal const string RpcKeyExchange = "VA_CharKey"; // server -> client: {key, time}
-        internal const string RpcCheckSig    = "VA_CharSig"; // client -> server: signed backup
+        internal const string RpcCheckSig    = "VA_CharSig"; // client -> server: signed backup in ONE message (0.2.37 and older clients)
+        // 0.2.38 (Fire 10-03: a 1.1 MB backup sent as one message hit Steam's 512 KB cap, k_EResultInvalidParam every frame, and
+        // blocked the login): the backup goes deflated and chunked over CharacterProfileTransport, announced first so the
+        // server holds the login profile until the restore has landed and the player loads the restored character.
+        internal const string RpcSigIncoming = "VA_CharSigIncoming"; // client -> server: a chunked backup follows
+        internal const string RpcCheckSigChunked = "VA_CharSig2";    // client -> server: the signed backup, chunked
         internal const string EmergencyPendingFlagKey = "VAEmergencyBackupPending";
+
+        // Server: connections whose announced backup has not arrived yet, and when each was announced.
+        private static readonly System.Collections.Generic.Dictionary<ZRpc, float> s_restoreInFlight =
+            new System.Collections.Generic.Dictionary<ZRpc, float>();
 
         private static byte[] _clientKey;     // client-side, key derived by the server
         private static long   _clientKeyTime; // matching server timestamp
@@ -68,7 +77,27 @@ namespace VerdantsAscent.Modules.Characters
 
         internal static void ForgetPeer(ZRpc rpc)
         {
-            if (rpc != null) s_peerKeyTime.Remove(rpc);
+            if (rpc == null) return;
+            s_peerKeyTime.Remove(rpc);
+            s_restoreInFlight.Remove(rpc);
+        }
+
+        /// <summary>Server: this connection announced a backup that has not arrived (the login profile waits for it).</summary>
+        internal static bool RestoreInFlight(ZRpc rpc) => rpc != null && s_restoreInFlight.ContainsKey(rpc);
+
+        /// <summary>Server: the client announced a chunked backup of <paramref name="bytes"/> bytes.</summary>
+        public static void OnServerBackupIncoming(ZRpc rpc, int bytes)
+        {
+            if (rpc == null) return;
+            s_restoreInFlight[rpc] = Time.realtimeSinceStartup;
+            Debug.Log($"[Characters] emergency-backup: {rpc.m_socket?.GetHostName()} is sending a signed backup ({bytes}B); its login waits for it.");
+        }
+
+        /// <summary>Server: the chunked backup arrived whole; verify and restore, then let the login go ahead.</summary>
+        public static void OnServerReceiveChunkedSignature(ZRpc rpc, byte[] payload)
+        {
+            try { OnServerReceiveSignature(rpc, new ZPackage(payload)); }
+            finally { if (rpc != null) s_restoreInFlight.Remove(rpc); }
         }
 
         private static string SessionPath(string steamId, string charName) =>
@@ -277,8 +306,12 @@ namespace VerdantsAscent.Modules.Characters
                 var outer = new ZPackage();
                 outer.Write(profileBytes);
                 outer.Write(sigBytes);
-                serverPeer.m_rpc.Invoke(RpcCheckSig, outer);
-                Debug.Log($"[Characters] emergency-backup: sent stored sidecars for {profile.m_filename} to server for verification.");
+                byte[] payload = outer.GetArray();
+                // Announced in this call (ahead of the client's peer info on the socket), then chunked like a profile upload.
+                serverPeer.m_rpc.Invoke(RpcSigIncoming, payload.Length);
+                string name = profile.m_filename;
+                CharacterProfileTransport.SendToPeer(serverPeer, RpcCheckSigChunked, payload,
+                    () => Debug.Log($"[Characters] emergency-backup: sent stored sidecars for {name} ({payload.Length}B, chunked) to the server for verification."));
             }
             catch (Exception ex) { Debug.LogWarning($"[Characters] TrySendStoredEmergencyBackup failed: {ex.Message}"); }
         }

@@ -56,8 +56,22 @@ namespace VerdantsAscent.Modules.AntiCheat
             public bool BypassScanning;
             /// <summary>Client's mod list captured from the most recent challenge response. Used for Discord reporting on kick.</summary>
             public Dictionary<string, string> ClientModList;
-            /// <summary>Full contents of the client's BepInEx LogOutput.log, sent with the challenge response. Used for Discord reporting on kick.</summary>
-            public byte[] ClientBepInExLog;
+
+            // 0.2.42 delta logs: the client's BepInEx log lives only in the cache file, never in memory. These fields say
+            // what that file holds, so each challenge asks for just the bytes after it. Main thread only.
+            /// <summary>Contiguous bytes of the client's log in the cache file; 0 = ask for the whole log.</summary>
+            public long LogHave;
+            /// <summary>Length of the log head covered by <see cref="LogHeadHash"/> (at most LogHeadMax).</summary>
+            public int LogHeadLen;
+            /// <summary>SHA-256 of log[0, LogHeadLen): the log's identity (its first line carries the launch time).</summary>
+            public byte[] LogHeadHash;
+            /// <summary>The last LogTailLen bytes of the log (ending at LogHave), kept in LogTail[0, LogTailLen).</summary>
+            public byte[] LogTail = new byte[LogTailMax];
+            public int LogTailLen;
+            /// <summary>Exact cache file, ClientLogs\{name}_{id}\LogOutput.log.</summary>
+            public string LogPath;
+            /// <summary>Raised by the disk thread when a cache write failed; the next challenge then asks for the whole log.</summary>
+            public VAngardeModValidator.LogDiskFlag Disk = new VAngardeModValidator.LogDiskFlag();
 
             /// <summary>Last cheat/debug commands this peer reported active (admin monitor); cached for detection embeds.</summary>
             public List<string> LastKnownAdminCommands;
@@ -81,19 +95,51 @@ namespace VerdantsAscent.Modules.AntiCheat
             public bool KickPending;
         }
 
-        // -- Chunked log reassembly state --
-        private class ChunkedLogState
+        // -- Streaming log transfer (0.2.42, replaces the chunk reassembly) --
+        // One per peer while a response is landing. Each slice goes straight to the cache file on the disk thread,
+        // so nothing log-sized is built or kept here. Main thread only.
+        private class LogTransfer
         {
+            public long PeerUid;
+            public string PeerId;                        // platform id, for the log lines
             public string Nonce;
-            public int TotalChunks;
+            public int Total;                            // chunks announced in chunk 0
+            public int Next;                             // index of the next chunk expected
+            public long Base;                            // log offset of the first byte (0 on a reset)
+            public long End;                             // log length the client planned to (-1 = old client, unknown)
+            public long Got;                             // bytes received so far
+            public byte Reason;                          // client's reason code (0 resume, 1-5 why it resets)
+            public bool Reset;                           // written beside the cache file, swapped in at the end
+            public bool Discard;                         // received for validation only, nothing written
+            public bool Legacy;                          // marker -1 (old client): its whole log, streamed as a reset
+            public bool CaptureOnly;
             public Dictionary<string, string> ModList;
-            public byte[] Hash;
-            public List<byte[]> Chunks;
-            public float FirstChunkTime;
+            public string Target;                        // the cache file
+            public VAngardeModValidator.LogDiskFlag Flag;
+            public float LastChunkTime;
+            public byte[] Head = new byte[LogHeadMax];   // reset only: the first bytes, hashed at the end
+            public int HeadLen;
+            public byte[] Tail = new byte[LogTailMax];   // reset only: the last bytes, the next anchor
+            public int TailLen;
+            public int Gc0;                              // evidence: GC count when chunk 0 arrived
+            public double SumMs, MaxMs;                  // evidence: main-thread time per chunk
         }
 
-        private static readonly Dictionary<long, ChunkedLogState> _pendingChunkedLogs = new Dictionary<long, ChunkedLogState>();
-        private const float ChunkedLogTimeout = 30f; // 30 seconds to receive all chunks
+        private static readonly Dictionary<long, LogTransfer> _logTransfers = new Dictionary<long, LogTransfer>();
+        // Cache file -> the peer writing it. Two connections with the same name and id would interleave their appends.
+        private static readonly Dictionary<string, long> _logPathOwners = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private const float LogTransferTimeout = 30f; // abort a transfer after 30 seconds without a chunk
+
+        // Wire v2: the challenge trailer says what the server holds; a response with marker -2 carries a byte range of the log.
+        private const int ChallengeProto = 2;
+        private const int LegacyChunkMarker = -1;
+        private const int RangeChunkMarker = -2;
+        private const int LogHeadMax = 1024;
+        private const int LogTailMax = 256;
+        private const long MaxLogBytes = 64L * 1024 * 1024;   // per transfer; a bigger range is refused, validation still runs
+        // Reason codes in a v2 response.
+        private const byte LogReasonResume = 0, LogReasonNone = 1, LogReasonShorter = 2, LogReasonHead = 3,
+                           LogReasonAnchor = 4, LogReasonReadError = 5;
 
         internal const string RPC_AdminSnapshot = "VA_vgas"; // client -> server: admin cheat-command snapshot
 
@@ -124,6 +170,10 @@ namespace VerdantsAscent.Modules.AntiCheat
             if (_znetPeersField == null)
                 Debug.LogWarning("[VAngarde] Could not find ZNet.m_peers field");
 
+            // 0.2.42 review: the kick report hops from the disk thread to the main thread through MainThreadDispatcher.
+            // Create its host here, on the main thread (ZNet.Awake): created from the disk thread it would throw.
+            MainThreadDispatcher.Enqueue(() => { });
+
             // Populate the mod-validation lists. Runs in ZNet.Awake postfix, so Chainloader.PluginInfos
             // is the full modset. Three lists, three roles:
             //   exact-match  = the REQUIRED set (client MUST match). AutoUpdateModList ON: regenerated from
@@ -144,6 +194,8 @@ namespace VerdantsAscent.Modules.AntiCheat
 
                 // Load lists FIRST so the exact-match regen can honor the server-only exclusions.
                 VAngardeModValidator.ReloadAll();
+                Debug.Log($"[VAngarde] AdminOnlyListMode = {(VAngardeConfig.AdminOnlyRequired ? "AdminRequired (admins must run every admin-only mod)" : "AdminWhitelist (only admins may run admin-only mods; admins are never required to, missing ones are suggested)")}, "
+                          + $"{VAngardeModValidator.AdminOnlyCount} admin-only mod(s).");
 
                 if (autoUpdate)
                 {
@@ -189,6 +241,9 @@ namespace VerdantsAscent.Modules.AntiCheat
             // Set up file watcher for hot-reload of list files
             VAngardeFileWatcher.Initialize();
 
+            // 0.2.42: says how to read the gen0/1/2 counters in the response lines (0 on Boehm = they move together).
+            FiresVAngarde.Log?.LogDebug($"[VAngarde] GC.MaxGeneration = {System.GC.MaxGeneration}");
+
             _initialized = true;
             LogVerbose("Anti-cheat system initialized (server-side)");
             EmitLoadSummary();
@@ -222,10 +277,19 @@ namespace VerdantsAscent.Modules.AntiCheat
         /// </summary>
         public static void Shutdown()
         {
+            List<LogTransfer> open;
             lock (_lock)
             {
                 _trackedPeers.Clear();
                 _violationHistory.Clear();
+                open = new List<LogTransfer>(_logTransfers.Values);
+                _logTransfers.Clear();
+                _logPathOwners.Clear();
+            }
+            foreach (var transfer in open)
+            {
+                if (transfer.Reset && !transfer.Discard)
+                    VAngardeModValidator.AbortClientLogReset(transfer.Target);
             }
             VAngardeFileWatcher.Shutdown();
             _initialized = false;
@@ -381,14 +445,12 @@ namespace VerdantsAscent.Modules.AntiCheat
         }
 
         /// <summary>
-        /// Called when a peer disconnects normally. Remove tracking.
+        /// Called when a peer disconnects normally. Remove tracking and abort its log transfer.
         /// </summary>
         public static void OnPeerDisconnected(ZNetPeer peer)
         {
-            lock (_lock)
-            {
-                _trackedPeers.Remove(peer.m_uid);
-            }
+            if (peer == null) return;
+            ForgetPeer(peer.m_uid, "peer disconnected");
         }
 
         // ==============================================================
@@ -418,6 +480,7 @@ namespace VerdantsAscent.Modules.AntiCheat
             var pkg = new ZPackage();
             pkg.Write(state.ChallengeNonce);
             pkg.Write(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            WriteLogRequest(pkg, state);
 
             try
             {
@@ -427,6 +490,33 @@ namespace VerdantsAscent.Modules.AntiCheat
             catch (Exception ex)
             {
                 Debug.LogWarning($"[VAngarde] Failed to send challenge to {state.PlatformId}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Challenge trailer v2 (0.2.42): how much of this client's log the server already holds, plus the head and
+        /// anchor hashes the client checks against its file. Old clients read only nonce + time and ignore it.
+        /// </summary>
+        private static void WriteLogRequest(ZPackage pkg, PeerState state)
+        {
+            // A failed cache write means the file no longer matches LogHave: ask for everything.
+            if (state.Disk.Failed || state.LogHeadHash == null) state.LogHave = 0;
+
+            pkg.Write(ChallengeProto);
+            pkg.Write(state.LogHave);
+            if (state.LogHave > 0)
+            {
+                pkg.Write(state.LogHeadLen);
+                pkg.Write(state.LogHeadHash);
+                pkg.Write(state.LogTailLen);
+                pkg.Write(Sha256(state.LogTail, 0, state.LogTailLen));
+            }
+            else
+            {
+                pkg.Write(0);
+                pkg.Write(Array.Empty<byte>());
+                pkg.Write(0);
+                pkg.Write(Array.Empty<byte>());
             }
         }
 
@@ -443,7 +533,11 @@ namespace VerdantsAscent.Modules.AntiCheat
         {
             if (pkg == null) return;
             if (!ShouldChallengePeers()) return;
-            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var clock = s_responseClock;
+            clock.Restart();
+            int gc0 = System.GC.CollectionCount(0), gc1 = System.GC.CollectionCount(1), gc2 = System.GC.CollectionCount(2);   // 0.2.41: GC vs lock in a slow response
+            s_gc0AtEntry = gc0;
+            s_chunkTransfer = null;
             s_phaseClock.Restart();
             s_phases.Length = 0;
             try { HandleChallengeResponse(sender, pkg); }
@@ -451,10 +545,20 @@ namespace VerdantsAscent.Modules.AntiCheat
             {
                 // Each response runs inside the server's RPC dispatch, the frame every relayed PvP hit waits on (R34).
                 double ms = clock.Elapsed.TotalMilliseconds;
+
+                // 0.2.42: this chunk's time goes on its transfer (the completing chunk is counted at completion).
+                var transfer = s_chunkTransfer;
+                s_chunkTransfer = null;
+                if (transfer != null)
+                {
+                    transfer.SumMs += ms;
+                    if (ms > transfer.MaxMs) transfer.MaxMs = ms;
+                }
+
                 if (ms >= SlowResponseReportMs)
                 {
                     Phase("rest");
-                    Debug.Log($"[VAngarde] challenge response from peer {sender} ({pkg.Size() / 1024} KB) held the main thread {ms:0.0} ms ({s_phases}).");
+                    Debug.Log($"[VAngarde] challenge response from peer {sender} ({pkg.Size() / 1024} KB) held the main thread {ms:0.0} ms ({s_phases}); GC gen0/1/2 +{System.GC.CollectionCount(0) - gc0}/+{System.GC.CollectionCount(1) - gc1}/+{System.GC.CollectionCount(2) - gc2}.");
                 }
             }
         }
@@ -464,6 +568,11 @@ namespace VerdantsAscent.Modules.AntiCheat
         // Where a slow response's time went (R43: 53.8 ms and 60.1 ms with every HardeningV2 check off). Main thread only.
         private static readonly System.Diagnostics.Stopwatch s_phaseClock = new System.Diagnostics.Stopwatch();
         private static readonly StringBuilder s_phases = new StringBuilder();
+
+        // 0.2.42 evidence: the whole-chunk clock, and the log transfer the chunk being handled advanced. Main thread only.
+        private static readonly System.Diagnostics.Stopwatch s_responseClock = new System.Diagnostics.Stopwatch();
+        private static LogTransfer s_chunkTransfer;
+        private static int s_gc0AtEntry;
 
         private static void Phase(string name)
         {
@@ -504,25 +613,27 @@ namespace VerdantsAscent.Modules.AntiCheat
 
             try
             {
-                // Read response header. All responses are now chunked-format
-                // (chunkMarker == -1 followed by totalChunks + chunkIndex). The single-shot
-                // inline wire format was removed once SendChunkedLogResponse became the only
-                // client-side sender; anything else here is a stale/older-build response and
-                // is treated as malformed.
+                // Read response header. All responses are chunked-format: marker, totalChunks,
+                // chunkIndex. Marker -1 = the whole log (old clients, and new clients answering an
+                // old server); marker -2 (0.2.42) = a byte range of the log, with base/end/reason
+                // in chunk 0. The single-shot inline wire format was removed once
+                // SendChunkedLogResponse became the only client-side sender; anything else here is a
+                // stale/older-build response and is ignored.
                 string echoedNonce = pkg.ReadString();
                 int chunkMarker = pkg.ReadInt();
-                if (chunkMarker != -1)
+                if (chunkMarker != LegacyChunkMarker && chunkMarker != RangeChunkMarker)
                 {
                     LogVerbose($"Received non-chunked response from {state.PlatformId} (marker={chunkMarker}); stale client build, ignoring");
                     return;
                 }
+                bool legacy = chunkMarker == LegacyChunkMarker;
 
                 int totalChunks = pkg.ReadInt();
                 int chunkIndex = pkg.ReadInt();
 
                 if (chunkIndex == 0)
                 {
-                    // First chunk - contains mod list + hash + first log data
+                    // First chunk - contains mod list + hash (+ v2 range) + first log data
                     int chunkModCount = pkg.ReadInt();
                     var chunkClientMods = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     for (int i = 0; i < chunkModCount && i < 500; i++)
@@ -532,6 +643,14 @@ namespace VerdantsAscent.Modules.AntiCheat
                         chunkClientMods[guid] = version;
                     }
                     byte[] chunkClientHash = pkg.ReadByteArray();
+                    long logBase = 0, logEnd = -1;
+                    byte logReason = LogReasonNone;
+                    if (!legacy)
+                    {
+                        logBase = pkg.ReadLong();
+                        logEnd = pkg.ReadLong();
+                        logReason = pkg.ReadByte();
+                    }
                     byte[] firstChunkData = pkg.ReadByteArray();
                     Phase("read");
 
@@ -625,7 +744,7 @@ namespace VerdantsAscent.Modules.AntiCheat
                     if (!logCaptureOnly && VAngardeConfig.EnforceDllHashMatch?.Value == true)
                     {
                         if (integrity == null) { OnViolation(state, "dll hash: no integrity payload"); return; }
-                        string dllLie = VAngardeIntegrityCheck.CheckExpectedHashes(integrity, VAngardeModValidator.ExactMatchHashes);
+                        string dllLie = VAngardeIntegrityCheck.CheckExpectedHashes(integrity, VAngardeModValidator.RequiredHashes(state.IsValheimAdmin));
                         if (dllLie != null) { OnViolation(state, dllLie); return; }
                     }
 
@@ -634,106 +753,50 @@ namespace VerdantsAscent.Modules.AntiCheat
                     // Store mod list immediately
                     state.ClientModList = new Dictionary<string, string>(chunkClientMods, StringComparer.OrdinalIgnoreCase);
 
-                    // Initialize chunked log state
-                    var chunkedState = new ChunkedLogState
-                    {
-                        Nonce = echoedNonce,
-                        TotalChunks = totalChunks,
-                        ModList = chunkClientMods,
-                        Hash = chunkClientHash,
-                        Chunks = new List<byte[]>(totalChunks),
-                        FirstChunkTime = Time.time
-                    };
-                    chunkedState.Chunks.Add(firstChunkData);
+                    LogVerbose($"Received first chunk (1/{totalChunks}) from {state.PlatformId}, log slice: {firstChunkData.Length} bytes");
 
-                    lock (_lock)
-                    {
-                        _pendingChunkedLogs[state.Peer.m_uid] = chunkedState;
-                    }
-
-                    LogVerbose($"Received first chunk (1/{totalChunks}) from {state.PlatformId}, log size: {firstChunkData.Length} bytes");
-
-                    // Single-chunk fast path: if the client only sent one chunk (small or empty
-                    // log), reassemble + process immediately instead of waiting for more chunks
-                    // that will never arrive.
-                    if (totalChunks <= 1)
-                    {
-                        lock (_lock)
-                        {
-                            _pendingChunkedLogs.Remove(state.Peer.m_uid);
-                        }
-                        var modListCopy = new Dictionary<string, string>(chunkClientMods);
-                        ProcessCompleteLog(state, modListCopy, firstChunkData ?? new byte[0], logCaptureOnly);
-                    }
+                    // The log streams to the cache file from here, chunk by chunk (no reassembly). A
+                    // one-chunk response completes at once and runs the verdict.
+                    StartLogTransfer(state, echoedNonce, legacy, totalChunks, logBase, logEnd, logReason,
+                        chunkClientMods, logCaptureOnly, firstChunkData);
                 }
                 else
                 {
-                    // Subsequent chunk - just log data
-                    byte[] chunkData = pkg.ReadByteArray();
-                    Phase("read");
-
-                    ChunkedLogState chunkedState;
+                    // Subsequent chunk - just log data. Find its transfer before reading the slice, so a
+                    // stale chunk costs no copy.
+                    LogTransfer transfer;
                     lock (_lock)
                     {
-                        if (!_pendingChunkedLogs.TryGetValue(state.Peer.m_uid, out chunkedState))
-                        {
-                            Debug.LogWarning($"[VAngarde] Received chunk {chunkIndex} from {state.PlatformId} but no pending chunked log state");
-                            return;
-                        }
+                        _logTransfers.TryGetValue(state.Peer.m_uid, out transfer);
                     }
 
-                    // Verify nonce matches
-                    if (echoedNonce != chunkedState.Nonce)
+                    // A chunk of an older or aborted response: drop it, never the transfer in flight.
+                    if (transfer == null || echoedNonce != transfer.Nonce)
                     {
-                        Debug.LogWarning($"[VAngarde] Chunk {chunkIndex} nonce mismatch from {state.PlatformId}");
-                        lock (_lock)
-                        {
-                            _pendingChunkedLogs.Remove(state.Peer.m_uid);
-                        }
+                        LogVerbose($"Dropped log chunk {chunkIndex + 1}/{totalChunks} from {state.PlatformId}: no transfer for that response");
                         return;
                     }
 
-                    // CRITICAL: Lock during chunk collection to prevent race conditions
-                    // Multiple threads could try to add chunks simultaneously
-                    lock (_lock)
+                    // The framing changed mid-response: keep nothing new, but the verdict needs only chunk 0, so it runs now
+                    // instead of leaving the peer unvalidated until the challenge timeout kicks it (0.2.42 review).
+                    if (legacy != transfer.Legacy || totalChunks != transfer.Total)
                     {
-                        // Re-check state exists after acquiring lock
-                        if (!_pendingChunkedLogs.TryGetValue(state.Peer.m_uid, out chunkedState))
-                        {
-                            Debug.LogWarning($"[VAngarde] Chunked log state was removed during processing for {state.PlatformId}");
-                            return;
-                        }
-
-                        chunkedState.Chunks.Add(chunkData);
-                        LogVerbose($"Received chunk {chunkIndex + 1}/{chunkedState.TotalChunks} from {state.PlatformId}, size: {chunkData.Length} bytes");
-
-                        // Check if we have all chunks (inside lock to prevent double-processing)
-                        if (chunkedState.Chunks.Count >= chunkedState.TotalChunks)
-                        {
-                            // Reassemble log (still inside lock)
-                            int totalSize = chunkedState.Chunks.Sum(c => c.Length);
-                            byte[] completeLog = new byte[totalSize];
-                            int offset = 0;
-                            foreach (var chunk in chunkedState.Chunks)
-                            {
-                                Array.Copy(chunk, 0, completeLog, offset, chunk.Length);
-                                offset += chunk.Length;
-                            }
-
-                            Debug.Log($"[VAngarde] Reassembled chunked log from {state.PlatformId}: {completeLog.Length / 1024}KB from {chunkedState.TotalChunks} chunks");
-                            Phase("reassemble");
-
-                            // Clean up pending state (already inside lock)
-                            _pendingChunkedLogs.Remove(state.Peer.m_uid);
-
-                            // Store data for processing outside lock
-                            var modListCopy = new Dictionary<string, string>(chunkedState.ModList);
-
-                            // Process complete log OUTSIDE the lock to avoid blocking other threads
-                            // The lock only protects the chunk collection, not the expensive processing
-                            ProcessCompleteLog(state, modListCopy, completeLog, logCaptureOnly);
-                        }
+                        AbortLogTransfer(state, transfer, $"chunk {chunkIndex + 1}/{totalChunks} does not match {transfer.Total} chunk(s)");
+                        ProcessCompleteLog(state, new Dictionary<string, string>(transfer.ModList), transfer.CaptureOnly);
+                        return;
                     }
+                    // Chunks arrive in order (reliable socket, straight to the server). A gap or a repeat is a bug, never a
+                    // corrupt file: write nothing more from this response, but keep counting so its last chunk runs the verdict.
+                    if (chunkIndex != transfer.Next)
+                    {
+                        DiscardRestOfTransfer(transfer, $"got chunk {chunkIndex + 1}, expected {transfer.Next + 1}");
+                        if (chunkIndex < transfer.Next) return;   // a repeat of an earlier chunk
+                        transfer.Next = chunkIndex;               // resync to the sender; AcceptLogChunk counts this one
+                    }
+
+                    byte[] chunkData = pkg.ReadByteArray();
+                    Phase("read");
+                    AcceptLogChunk(state, transfer, chunkData);
                 }
             }
             catch (Exception ex)
@@ -743,21 +806,13 @@ namespace VerdantsAscent.Modules.AntiCheat
         }
 
         /// <summary>
-        /// Processes a complete log (either from a single response or reassembled from chunks).
+        /// Runs once a response's last chunk has landed (or at once when its log was refused). The log itself
+        /// was already streamed to the cache file, chunk by chunk. Never called inside <c>_lock</c>.
         /// </summary>
-        private static void ProcessCompleteLog(PeerState state, Dictionary<string, string> clientMods, 
-            byte[] logBytes, bool logCaptureOnly)
+        private static void ProcessCompleteLog(PeerState state, Dictionary<string, string> clientMods, bool logCaptureOnly)
         {
             try
             {
-                state.ClientBepInExLog = logBytes;
-                LogVerbose($"Received {logBytes.Length} bytes of client BepInEx log from {state.PlatformId}");
-
-                // Persist to disk so it survives across sessions and can be retrieved on request
-                string playerName = state.Peer?.m_playerName ?? "unknown";
-                VAngardeModValidator.CacheClientLog(state.PlatformId, playerName, logBytes);
-                Phase("cachelog");
-
                 // In log-capture-only mode (VAngarde anti-cheat disabled OR this was a
                 // periodic log-refresh re-challenge), we're done: the log is cached.
                 // Skip mod validation, admin caching, and violation plumbing entirely.
@@ -817,6 +872,8 @@ namespace VerdantsAscent.Modules.AntiCheat
                     {
                         state.Validated = true;
                         LogVerbose($"Admin {state.PlatformId} passed ({clientMods.Count} mods; whitelist now {VAngardeModValidator.WhitelistCount})");
+                        // 0.2.40 AdminWhitelist: the admin-only mods this admin lacks are suggested, never required.
+                        VAngardeAdminSuggest.Suggest(state.Peer, state.PlatformId, clientMods);
                         return;
                     }
 
@@ -853,6 +910,348 @@ namespace VerdantsAscent.Modules.AntiCheat
         }
 
         // ==============================================================
+        // Streaming log transfer (server, 0.2.42)
+        // ==============================================================
+
+        /// <summary>
+        /// Chunk 0 passed verification: decide what this response's log bytes are for, then take slice 0.
+        ///   delta   - reason 0 and base == what we hold: appended to the cache file.
+        ///   reset   - reason 1-5 from 0, or an old client's whole log (marker -1): written beside the cache
+        ///             file and swapped in at the last chunk.
+        ///   discard - anything else: received so the verdict still runs at the last chunk, nothing written,
+        ///             and the next challenge asks for the whole log.
+        /// </summary>
+        private static void StartLogTransfer(PeerState state, string nonce, bool legacy, int total,
+            long logBase, long logEnd, byte reason, Dictionary<string, string> mods, bool captureOnly, byte[] slice0)
+        {
+            long uid = state.Peer.m_uid;
+            LogTransfer previous;
+            lock (_lock)
+            {
+                _logTransfers.TryGetValue(uid, out previous);
+            }
+            if (previous != null)
+                AbortLogTransfer(state, previous, "superseded by a new response");
+
+            if (!LogRangeIsSane(legacy, total, logBase, logEnd))
+            {
+                // Sizes come off the wire: refuse the log, never the player. The verdict needs chunk 0 only, so it
+                // runs now; later chunks of this response find no transfer and are dropped.
+                state.LogHave = 0;
+                string why = !legacy && logBase >= 0 && logEnd >= logBase && logEnd > MaxLogBytes
+                    ? $"log end {logEnd} B is over the {MaxLogBytes} B cache cap"
+                    : $"bad size: base {logBase}, end {logEnd}, {total} chunk(s)";
+                FiresVAngarde.Log?.LogDebug($"[VAngarde] log transfer from {state.PlatformId} aborted ({why}) at chunk 0/{total}; kept 0 B");
+                ProcessCompleteLog(state, new Dictionary<string, string>(mods), captureOnly);
+                return;
+            }
+
+            var transfer = new LogTransfer
+            {
+                PeerUid = uid,
+                PeerId = state.PlatformId,
+                Nonce = nonce,
+                Total = total,
+                Base = legacy ? 0 : logBase,
+                End = legacy ? -1 : logEnd,
+                Reason = reason,
+                Legacy = legacy,
+                CaptureOnly = captureOnly,
+                ModList = mods,
+                LastChunkTime = Time.time,
+                Gc0 = s_gc0AtEntry
+            };
+
+            if (legacy || (reason != LogReasonResume && logBase == 0))
+                transfer.Reset = true;
+            else if (!(reason == LogReasonResume && logBase > 0 && logBase == state.LogHave && !state.Disk.Failed))
+                transfer.Discard = true;
+
+            // No usable path, or another connection with the same name and id writes that file: discard.
+            if (!transfer.Discard)
+            {
+                transfer.Target = ClaimLogPath(state);
+                if (transfer.Target == null) transfer.Discard = true;
+            }
+
+            if (transfer.Discard)
+            {
+                state.LogHave = 0;
+            }
+            else if (transfer.Reset)
+            {
+                // What we held no longer describes the client's log; the reset replaces it at the last chunk.
+                // A fresh flag, so a failure left over from an earlier transfer cannot spoil this one.
+                state.LogHave = 0;
+                state.LogHeadLen = 0;
+                state.LogHeadHash = null;
+                state.LogTailLen = 0;
+                state.Disk = new VAngardeModValidator.LogDiskFlag();
+                VAngardeModValidator.BeginClientLogReset(transfer.Target, state.Disk);
+            }
+            transfer.Flag = state.Disk;
+
+            lock (_lock)
+            {
+                _logTransfers[uid] = transfer;
+            }
+            AcceptLogChunk(state, transfer, slice0);
+        }
+
+        /// <summary>
+        /// One slice of the log, in order. The array is handed to the disk thread as is (ReadByteArray made it,
+        /// so it is ours); that is the only copy of the log the server keeps, and only until it is written.
+        /// </summary>
+        private static void AcceptLogChunk(PeerState state, LogTransfer transfer, byte[] data)
+        {
+            if (data == null) data = Array.Empty<byte>();
+            long limit = transfer.Legacy ? (long)transfer.Total * ResponseChunkSize : transfer.End - transfer.Base;
+            if (transfer.Got + data.Length > limit)
+            {
+                // Count the chunk, write nothing: the verdict still runs on the last chunk (0.2.42 review).
+                DiscardRestOfTransfer(transfer, $"{transfer.Got + data.Length} B is past the {limit} B announced");
+                data = Array.Empty<byte>();
+            }
+            s_chunkTransfer = transfer;
+
+            long offset = transfer.Got;
+            transfer.Next++;
+            transfer.Got += data.Length;
+            transfer.LastChunkTime = Time.time;
+
+            if (data.Length > 0 && !transfer.Discard)
+            {
+                if (transfer.Reset)
+                {
+                    if (transfer.HeadLen < LogHeadMax)
+                    {
+                        int n = Math.Min(LogHeadMax - transfer.HeadLen, data.Length);
+                        Buffer.BlockCopy(data, 0, transfer.Head, transfer.HeadLen, n);
+                        transfer.HeadLen += n;
+                    }
+                    KeepTail(transfer.Tail, ref transfer.TailLen, data);
+                    VAngardeModValidator.AppendClientLog(transfer.Target, true, data, offset, transfer.Flag);
+                }
+                else
+                {
+                    // A delta's prefix is good even if later chunks never come, so publish it now.
+                    VAngardeModValidator.AppendClientLog(transfer.Target, false, data, transfer.Base + offset, transfer.Flag);
+                    state.LogHave = transfer.Base + transfer.Got;
+                    KeepTail(state.LogTail, ref state.LogTailLen, data);
+                }
+            }
+            Phase("append");
+
+            if (transfer.Next >= transfer.Total)
+                CompleteLogTransfer(state, transfer);
+        }
+
+        /// <summary>
+        /// The last chunk landed: settle the cache file, then run the verdict outside <c>_lock</c> (which only
+        /// guards the maps), then print the summary line.
+        /// </summary>
+        private static void CompleteLogTransfer(PeerState state, LogTransfer transfer)
+        {
+            lock (_lock)
+            {
+                if (_logTransfers.TryGetValue(transfer.PeerUid, out var current) && current == transfer)
+                    _logTransfers.Remove(transfer.PeerUid);
+            }
+            s_chunkTransfer = null;
+
+            if (transfer.Legacy) transfer.End = transfer.Got;
+            if (transfer.Got != transfer.End - transfer.Base)
+            {
+                // Every chunk came but the bytes do not add up: keep nothing new. The verdict still runs, as for
+                // any response whose last chunk landed.
+                AbortLogTransfer(state, transfer, $"{transfer.Got} B of the {transfer.End - transfer.Base} B announced");
+                ProcessCompleteLog(state, new Dictionary<string, string>(transfer.ModList), transfer.CaptureOnly);
+                return;
+            }
+
+            if (transfer.Reset && !transfer.Discard)
+            {
+                if (transfer.Got == 0)
+                {
+                    // An empty log keeps the cached file, as before.
+                    VAngardeModValidator.AbortClientLogReset(transfer.Target);
+                }
+                else
+                {
+                    VAngardeModValidator.CommitClientLogReset(transfer.Target, transfer.Flag, state.PlatformId, transfer.Got);
+                    state.LogHave = transfer.Got;
+                    state.LogHeadLen = transfer.HeadLen;
+                    state.LogHeadHash = Sha256(transfer.Head, 0, transfer.HeadLen);
+                    Buffer.BlockCopy(transfer.Tail, 0, state.LogTail, 0, transfer.TailLen);
+                    state.LogTailLen = transfer.TailLen;
+                }
+            }
+            // A delta already published LogHave and the tail, chunk by chunk.
+
+            ProcessCompleteLog(state, new Dictionary<string, string>(transfer.ModList), transfer.CaptureOnly);
+
+            // Counted after the verdict, so the last chunk's time includes it.
+            double ms = s_responseClock.Elapsed.TotalMilliseconds;
+            transfer.SumMs += ms;
+            if (ms > transfer.MaxMs) transfer.MaxMs = ms;
+            string kind = transfer.Discard ? "discard" : transfer.Legacy ? "legacy" : transfer.Reset ? "reset" : "delta";
+            string reasonText = transfer.Legacy ? "old client" : transfer.Reason.ToString();
+            FiresVAngarde.Log?.LogDebug($"[VAngarde] log transfer from {transfer.PeerId}: {kind} base {transfer.Base} +{transfer.Got} B in {transfer.Total} chunk(s) -> have {state.LogHave} B; reason {reasonText}; worst chunk {transfer.MaxMs:0.0} ms, sum {transfer.SumMs:0.0} ms; GC +{System.GC.CollectionCount(0) - transfer.Gc0}; heap {System.GC.GetTotalMemory(false) / (1024.0 * 1024.0):0.0} MB");
+        }
+
+        /// <summary>
+        /// Drops the rest of a transfer without ending it: nothing more is written, but its chunks are still counted so
+        /// its last chunk runs the verdict. A reset's temp file holds a broken copy, so it goes now (the disk thread is
+        /// FIFO: it runs after the appends already queued); the live cache file is untouched.
+        /// </summary>
+        private static void DiscardRestOfTransfer(LogTransfer transfer, string why)
+        {
+            if (transfer.Discard) return;
+            if (transfer.Reset) VAngardeModValidator.AbortClientLogReset(transfer.Target);
+            transfer.Discard = true;
+            FiresVAngarde.Log?.LogDebug($"[VAngarde] log transfer from {transfer.PeerId}: {why}; the rest of it is dropped, the verdict still runs on its last chunk");
+        }
+
+        /// <summary>
+        /// Ends a transfer early. A delta keeps the prefix it already appended (LogHave was published per
+        /// chunk); a reset drops its temp file, so the next challenge asks for the whole log again.
+        /// </summary>
+        private static void AbortLogTransfer(PeerState state, LogTransfer transfer, string why)
+        {
+            lock (_lock)
+            {
+                if (_logTransfers.TryGetValue(transfer.PeerUid, out var current) && current == transfer)
+                    _logTransfers.Remove(transfer.PeerUid);
+            }
+            if (s_chunkTransfer == transfer) s_chunkTransfer = null;
+
+            if (transfer.Reset && !transfer.Discard)
+                VAngardeModValidator.AbortClientLogReset(transfer.Target);
+            if (state != null && (transfer.Reset || transfer.Discard))
+                state.LogHave = 0;
+
+            FiresVAngarde.Log?.LogDebug($"[VAngarde] log transfer from {transfer.PeerId} aborted ({why}) at chunk {transfer.Next}/{transfer.Total}; kept {(state != null ? state.LogHave : 0)} B");
+        }
+
+        /// <summary>
+        /// The peer's cache file, claimed for its transfers. Null when there is no usable path, or when another
+        /// tracked connection with the same name and id already writes it (appends would interleave).
+        /// </summary>
+        private static string ClaimLogPath(PeerState state)
+        {
+            if (state.LogPath == null)
+                state.LogPath = VAngardeModValidator.ClientLogPath(state.PlatformId, state.Peer?.m_playerName ?? "unknown");
+            if (state.LogPath == null) return null;
+
+            long uid = state.Peer.m_uid;
+            lock (_lock)
+            {
+                if (_logPathOwners.TryGetValue(state.LogPath, out long owner) && owner != uid && _trackedPeers.ContainsKey(owner))
+                    return null;
+                _logPathOwners[state.LogPath] = uid;
+            }
+            return state.LogPath;
+        }
+
+        /// <summary>
+        /// Drops a peer: its tracking, its log transfer (a reset's temp file is deleted) and its claim on the
+        /// cache file. Used on disconnect and after a kick (ForceDisconnect skips ZNet.Disconnect).
+        /// </summary>
+        private static void ForgetPeer(long uid, string why)
+        {
+            PeerState state;
+            LogTransfer transfer;
+            lock (_lock)
+            {
+                _trackedPeers.TryGetValue(uid, out state);
+                _trackedPeers.Remove(uid);
+                _logTransfers.TryGetValue(uid, out transfer);
+                if (state?.LogPath != null && _logPathOwners.TryGetValue(state.LogPath, out long owner) && owner == uid)
+                    _logPathOwners.Remove(state.LogPath);
+            }
+            if (transfer != null)
+                AbortLogTransfer(state, transfer, why);
+        }
+
+        /// <summary>
+        /// Wire sizes are checked before anything is written: the cache file never grows past MaxLogBytes (the range's
+        /// END is capped, not just one transfer, so periodic deltas can't append without bound), and the chunk count
+        /// must match the range exactly. An old client's whole log: at most the chunks MaxLogBytes takes.
+        /// </summary>
+        private static bool LogRangeIsSane(bool legacy, int total, long logBase, long logEnd)
+        {
+            if (total < 1) return false;
+            if (legacy) return total <= ExpectedLogChunks(MaxLogBytes);
+            if (logBase < 0 || logEnd < logBase || logEnd > MaxLogBytes) return false;
+            long span = logEnd - logBase;
+            return total == ExpectedLogChunks(span);
+        }
+
+        // Chunks for a byte range: at least one, since chunk 0 always carries the mod list.
+        private static int ExpectedLogChunks(long bytes)
+        {
+            return bytes <= 0 ? 1 : (int)((bytes + ResponseChunkSize - 1) / ResponseChunkSize);
+        }
+
+        // Keeps the last tail.Length bytes of a stream in tail[0, tailLen).
+        private static void KeepTail(byte[] tail, ref int tailLen, byte[] data)
+        {
+            int cap = tail.Length;
+            if (data.Length >= cap)
+            {
+                Buffer.BlockCopy(data, data.Length - cap, tail, 0, cap);
+                tailLen = cap;
+                return;
+            }
+            int keep = Math.Min(tailLen, cap - data.Length);
+            if (keep > 0 && keep < tailLen)
+                Array.Copy(tail, tailLen - keep, tail, 0, keep);   // overlapping move: Array.Copy handles it
+            Buffer.BlockCopy(data, 0, tail, keep, data.Length);
+            tailLen = keep + data.Length;
+        }
+
+        private static byte[] Sha256(byte[] data, int offset, int count)
+        {
+            using (var sha = SHA256.Create())
+                return sha.ComputeHash(data, offset, count);
+        }
+
+        /// <summary>
+        /// Kick report with the client's log. The log lives only in the cache file now, so it is read on the
+        /// disk thread (FIFO: every queued append has landed by then) and handed to Discord back on the main
+        /// thread. A peer that never sent a log passes null, as before.
+        /// </summary>
+        private static void KickWithLog(PeerState state, string playerName, string reason, Action onComplete)
+        {
+            string platformId = state.PlatformId;
+            var modList = state.ClientModList;
+            // 0.2.42 review: the last good cache file is attached even after an aborted / refused refresh (LogHave = 0
+            // then, but the file is still the previous complete log); a missing file reads as null. No disk read at all
+            // unless a Discord sink is active.
+            string path = DiscordSink.IsActive() ? state.LogPath : null;
+            if (path == null)
+            {
+                DiscordSink.OnAntiCheatKick(playerName, platformId, reason, modList, null, onComplete);
+                return;
+            }
+
+            VAngardeModValidator.ReadClientLogQueued(path, logBytes =>
+            {
+                // Disk thread -> main thread. If the hop itself fails, still kick (without the log) rather than never.
+                try
+                {
+                    MainThreadDispatcher.Enqueue(() =>
+                        DiscordSink.OnAntiCheatKick(playerName, platformId, reason, modList, logBytes, onComplete));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[VAngarde] kick report hop to the main thread failed ({ex.Message}); kicking without the log");
+                    onComplete?.Invoke();
+                }
+            });
+        }
+
+        // ==============================================================
         // Client-Side Response Builder (static helper for VAngardePatches)
         // ==============================================================
 
@@ -870,6 +1269,10 @@ namespace VerdantsAscent.Modules.AntiCheat
         /// The log file read is dispatched to a worker thread so the Unity main thread
         /// never stalls on multi-megabyte disk I/O during a login; the RPC is still
         /// invoked on the main thread from the completion callback.
+        ///
+        /// 0.2.42: a newer server appends what it already holds of our log (trailer v2).
+        /// Then only the new bytes go, read slice by slice from the file (marker -2);
+        /// an older server still gets the whole log (marker -1).
         /// </summary>
         public static void HandleServerChallenge(ZRpc rpc, ZPackage pkg)
         {
@@ -879,6 +1282,7 @@ namespace VerdantsAscent.Modules.AntiCheat
             {
                 string nonce = pkg.ReadString();
                 long timestamp = pkg.ReadLong();
+                LogRequest logRequest = ReadLogRequest(pkg);   // null = older server
 
                 // Enumerate loaded BepInEx plugins (shared helper - see ClientLogRelay/Transport)
                 var modList = FiresCore.ClientLogRelay.Transport
@@ -903,6 +1307,18 @@ namespace VerdantsAscent.Modules.AntiCheat
                 // The audit walks every assembly and the whole plugins tree (a 1 GB folder on a big modpack): a worker, not the RPC.
                 var auditCapture = Task.Run(() => VAngardeModListAudit.Capture());
 
+                if (logRequest != null)
+                {
+                    // v2 server: plan the byte range on a worker (reads at most 1280 bytes, never the whole
+                    // file), then stream file slices once routing is up.
+                    var request = logRequest;
+                    var logPlan = Task.Run(() => PlanLogRange(request.Have, request.HeadLen, request.HeadHash,
+                        request.AnchorLen, request.AnchorHash));
+                    FiresCore.Async.MainThreadDispatcher.StartRoutine(
+                        SendResponseWhenRouted(nonceCapture, sortedCapture, hashCapture, null, logPlan, pluginHashing, auditCapture));
+                    return;
+                }
+
                 FiresCore.ClientLogRelay.Transport.ClientLogCollector
                     .ReadLocalBepInExLogAsync(logData =>
                     {
@@ -916,7 +1332,7 @@ namespace VerdantsAscent.Modules.AntiCheat
                             // routing to come up, then send. (Always chunked, even for a 1-chunk payload:
                             // ProcessCompleteLog fires after the first chunk lands, one wire format.)
                             FiresCore.Async.MainThreadDispatcher.StartRoutine(
-                                SendResponseWhenRouted(nonceCapture, sortedCapture, hashCapture, safeLogData, pluginHashing, auditCapture));
+                                SendResponseWhenRouted(nonceCapture, sortedCapture, hashCapture, safeLogData, null, pluginHashing, auditCapture));
                         }
                         catch (Exception cbEx)
                         {
@@ -930,20 +1346,144 @@ namespace VerdantsAscent.Modules.AntiCheat
             }
         }
 
+        // What a v2 server holds of this client's log (challenge trailer).
+        private sealed class LogRequest
+        {
+            public long Have;
+            public int HeadLen;
+            public byte[] HeadHash;
+            public int AnchorLen;
+            public byte[] AnchorHash;
+        }
+
+        // Client: the byte range of LogOutput.log one response carries. End is fixed when planned; bytes BepInEx
+        // writes during the send go out with the next delta.
+        private sealed class LogPlan
+        {
+            public string FilePath;
+            public long Base;
+            public long End;
+            public byte Reason;
+            public string Error;   // reason 5: what failed (logged on the main thread)
+        }
+
+        /// <summary>
+        /// Reads the optional challenge trailer v2. Null for an older server (nonce + time only) or an unreadable
+        /// trailer; that server gets the whole log, as before.
+        /// </summary>
+        private static LogRequest ReadLogRequest(ZPackage pkg)
+        {
+            try
+            {
+                if (pkg.GetPos() >= pkg.Size()) return null;
+                int proto = pkg.ReadInt();
+                if (proto < ChallengeProto) return null;
+                var request = new LogRequest();
+                request.Have = pkg.ReadLong();
+                request.HeadLen = pkg.ReadInt();
+                request.HeadHash = pkg.ReadByteArray();
+                request.AnchorLen = pkg.ReadInt();
+                request.AnchorHash = pkg.ReadByteArray();
+                return request;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Client, worker thread: which bytes of LogOutput.log this response carries. [have, len) when the server's
+        /// copy is still a prefix of our file (length, head hash and anchor hash all match), else [0, len) as a reset
+        /// with the reason. Reads at most LogHeadMax + LogTailMax (1280) bytes, never the whole file.
+        /// </summary>
+        private static LogPlan PlanLogRange(long have, int headLen, byte[] headHash, int anchorLen, byte[] anchorHash)
+        {
+            // Same file and sharing as ClientLogCollector.ReadLocalBepInExLog, so BepInEx keeps writing meanwhile.
+            var plan = new LogPlan { FilePath = Path.Combine(BepInEx.Paths.BepInExRootPath, "LogOutput.log") };
+            try
+            {
+                if (!File.Exists(plan.FilePath))
+                {
+                    plan.Reason = have > 0 ? LogReasonShorter : LogReasonNone;
+                    return plan;
+                }
+
+                using (var stream = new FileStream(plan.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    long len = stream.Length;
+                    plan.End = len;
+                    if (have <= 0)
+                        plan.Reason = LogReasonNone;
+                    else if (len < have)
+                        plan.Reason = LogReasonShorter;
+                    else if (headLen < 0 || headLen > LogHeadMax || headLen > have
+                             || !RangeHashMatches(stream, 0, headLen, headHash))
+                        plan.Reason = LogReasonHead;
+                    else if (anchorLen < 0 || anchorLen > LogTailMax || anchorLen > have
+                             || !RangeHashMatches(stream, have - anchorLen, anchorLen, anchorHash))
+                        plan.Reason = LogReasonAnchor;
+                    else
+                    {
+                        plan.Base = have;
+                        plan.Reason = LogReasonResume;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                plan.Base = 0;
+                plan.Reason = LogReasonReadError;
+                plan.Error = ex.Message;
+            }
+            return plan;
+        }
+
+        // SHA-256 of stream[offset, offset + count) against the server's hash. Nothing to check = a match.
+        private static bool RangeHashMatches(Stream stream, long offset, int count, byte[] expected)
+        {
+            if (count == 0) return true;
+            var buffer = new byte[count];
+            stream.Position = offset;
+            if (!ReadFully(stream, buffer, count)) return false;
+            using (var sha = SHA256.Create())
+                return ByteArraysEqual(sha.ComputeHash(buffer), expected);
+        }
+
+        private static bool ReadFully(Stream stream, byte[] buffer, int count)
+        {
+            int got = 0;
+            while (got < count)
+            {
+                int read = stream.Read(buffer, got, count - got);
+                if (read <= 0) return false;
+                got += read;
+            }
+            return true;
+        }
+
         /// <summary>
         /// Send the challenge response once the routed-RPC server peer id exists. During early login the
         /// client's ZRoutedRpc isn't wired to the server yet (GetServerPeerID() == 0), so poll for it rather
         /// than dropping the response and getting kicked on the server's challenge timeout.
+        /// A v2 server gets a byte range (<paramref name="logPlan"/>); an older one the whole log (<paramref name="logData"/>).
         /// </summary>
         private static IEnumerator SendResponseWhenRouted(string nonce,
-            List<KeyValuePair<string, string>> modList, byte[] hash, byte[] logData,
+            List<KeyValuePair<string, string>> modList, byte[] hash, byte[] logData, Task<LogPlan> logPlan,
             Task<Dictionary<string, string>> pluginHashing, Task<VAngardeModListAudit.Snapshot> auditCapture)
         {
-            while (!pluginHashing.IsCompleted || !auditCapture.IsCompleted) yield return null;
+            while (!pluginHashing.IsCompleted || !auditCapture.IsCompleted || (logPlan != null && !logPlan.IsCompleted)) yield return null;
             var pluginHashes = VAngardeIntegrityCheck.CompletedHashesOrEmpty(pluginHashing);
             var audit = auditCapture.Status == TaskStatus.RanToCompletion && auditCapture.Result != null
                 ? auditCapture.Result
                 : VAngardeModListAudit.Capture();
+            LogPlan plan = null;
+            if (logPlan != null)
+            {
+                plan = logPlan.Status == TaskStatus.RanToCompletion && logPlan.Result != null
+                    ? logPlan.Result
+                    : new LogPlan { Reason = LogReasonReadError, Error = logPlan.Exception?.GetBaseException().Message };
+            }
 
             float deadline = Time.time + 60f;
             while (true)
@@ -951,7 +1491,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                 long serverPeerId = ZRoutedRpc.instance != null ? ZRoutedRpc.instance.GetServerPeerID() : 0L;
                 if (serverPeerId != 0L)
                 {
-                    try { SendChunkedLogResponse(serverPeerId, nonce, modList, hash, logData, pluginHashes, audit); }
+                    try
+                    {
+                        if (plan != null) SendLogRangeResponse(serverPeerId, nonce, modList, hash, plan, pluginHashes, audit);
+                        else SendChunkedLogResponse(serverPeerId, nonce, modList, hash, logData, pluginHashes, audit);
+                    }
                     catch (Exception ex) { Debug.LogWarning($"[VAngarde] Failed to send challenge response: {ex.Message}"); }
                     yield break;
                 }
@@ -1036,23 +1580,7 @@ namespace VerdantsAscent.Modules.AntiCheat
                         }
                         pkg.Write(hashCapture);
                         pkg.Write(slice);
-
-                        // Hardening v2 - append the three-source modlist audit + an HMAC signature
-                        // over (nonce|hash) computed with the server's session UID. Server reads
-                        // these in RPC_OnChallengeResponse and enforces depending on
-                        // EnforceModListAudit / EnforceSessionSignature config toggles. Old servers
-                        // that don't read these fields ignore them harmlessly.
-                        VAngardeModListAudit.Write(pkg, audit ?? VAngardeModListAudit.Capture());
-                        byte[] sig = VAngardeSession.SignClient(
-                            VAngardeSession.ComposeSigInput(nonceCapture, hashCapture)) ?? Array.Empty<byte>();
-                        pkg.Write(sig);
-
-                        // Phase 5b - tamper bit + DLL content hashes. Tamper bit asks Harmony if any
-                        // non-trusted owner has patched our critical methods (Capture/Sign/etc.); DLL
-                        // hashes let the server's exact-match list pin a sha256 per plugin to catch
-                        // same-GUID-different-binary attacks.
-                        bool tampered = VAngardeIntegrityCheck.DetectHarmonyTampering(out _);
-                        VAngardeIntegrityCheck.Write(pkg, pluginHashes, tampered);
+                        WriteHardeningTrailer(pkg, nonceCapture, hashCapture, pluginHashes, audit);
                     }
                     else
                     {
@@ -1072,6 +1600,163 @@ namespace VerdantsAscent.Modules.AntiCheat
             // log-read completion callback without crashing.
             MainThreadDispatcher.Enqueue(() =>
                 MainThreadDispatcher.StartRoutine(routine));
+        }
+
+        /// <summary>
+        /// Hardening v2 trailer after the first log slice (both wire formats). The three-source modlist audit +
+        /// an HMAC signature over (nonce|hash) computed with the server's session UID; the server reads these in
+        /// RPC_OnChallengeResponse and enforces depending on EnforceModListAudit / EnforceSessionSignature. Then
+        /// Phase 5b: the tamper bit (has a non-trusted owner patched our critical methods - Capture/Sign/etc.?)
+        /// and DLL content hashes, so the exact-match list can pin a sha256 per plugin against
+        /// same-GUID-different-binary attacks. Old servers that don't read these fields ignore them harmlessly.
+        /// </summary>
+        private static void WriteHardeningTrailer(ZPackage pkg, string nonce, byte[] hash,
+            Dictionary<string, string> pluginHashes, VAngardeModListAudit.Snapshot audit)
+        {
+            VAngardeModListAudit.Write(pkg, audit ?? VAngardeModListAudit.Capture());
+            byte[] sig = VAngardeSession.SignClient(
+                VAngardeSession.ComposeSigInput(nonce, hash)) ?? Array.Empty<byte>();
+            pkg.Write(sig);
+
+            bool tampered = VAngardeIntegrityCheck.DetectHarmonyTampering(out _);
+            VAngardeIntegrityCheck.Write(pkg, pluginHashes, tampered);
+        }
+
+        /// <summary>
+        /// 0.2.42 v2 response: log bytes [plan.Base, plan.End), read slice by slice from LogOutput.log, never the
+        /// whole file. Same wire header as the legacy sender with marker -2; chunk 0 adds base, end and reason after
+        /// the mod hash. Paced like <see cref="SafeRoutedRpc.PacedChunkedSend"/>: two yields per chunk, every
+        /// package gated by <see cref="SafeRoutedRpc.InvokeSafe"/>.
+        /// </summary>
+        private static void SendLogRangeResponse(long serverPeerId, string nonce,
+            List<KeyValuePair<string, string>> modList, byte[] hash, LogPlan plan,
+            Dictionary<string, string> pluginHashes, VAngardeModListAudit.Snapshot audit)
+        {
+            IEnumerator routine = PacedLogRangeSend(serverPeerId, nonce ?? string.Empty,
+                modList ?? new List<KeyValuePair<string, string>>(), hash ?? Array.Empty<byte>(),
+                plan, pluginHashes, audit);
+
+            // Same hop as the legacy sender: routed RPC dispatch runs on the main thread.
+            MainThreadDispatcher.Enqueue(() =>
+                MainThreadDispatcher.StartRoutine(routine));
+        }
+
+        private static IEnumerator PacedLogRangeSend(long serverPeerId, string nonce,
+            List<KeyValuePair<string, string>> modList, byte[] hash, LogPlan plan,
+            Dictionary<string, string> pluginHashes, VAngardeModListAudit.Snapshot audit)
+        {
+            long span = plan.End - plan.Base;
+            // Over the server's cache cap (the log's END, like LogRangeIsSane): chunk 0 only, with the true range and no
+            // bytes. The server refuses the log and still validates, instead of us sending chunks it would drop.
+            bool tooBig = plan.End > MaxLogBytes;
+            int total = tooBig ? 1 : ExpectedLogChunks(span);
+            string kind = plan.Reason == LogReasonResume ? "delta" : $"reset({plan.Reason})";
+            FiresVAngarde.Log?.LogDebug($"[VAngarde] challenge response: log {kind} from {plan.Base} B, {(tooBig ? 0 : span)} B in {total} chunk(s) (file {plan.End} B)"
+                + (tooBig ? $"; the log is over the {MaxLogBytes} B cache cap, not sent" : "")
+                + (plan.Error != null ? $"; read error: {plan.Error}" : ""));
+
+            byte[] fullChunk = null;   // reused for every full slice: ZPackage.Write(byte[]) copies it at once
+            int sent = 0;
+            for (int chunkIndex = 0; chunkIndex < total; chunkIndex++)
+            {
+                if (ZRoutedRpc.instance == null || ZRoutedRpc.instance.GetServerPeerID() != serverPeerId)
+                {
+                    Debug.LogWarning($"[VAngarde] Log send stopped at chunk {chunkIndex + 1}/{total}: the server connection is gone.");
+                    break;
+                }
+
+                long offset = plan.Base + (long)chunkIndex * ResponseChunkSize;
+                int n = tooBig ? 0 : (int)Math.Min(ResponseChunkSize, plan.End - offset);
+                byte[] slice = n <= 0 ? Array.Empty<byte>()
+                    : n == ResponseChunkSize ? (fullChunk ?? (fullChunk = new byte[ResponseChunkSize]))
+                    : new byte[n];
+                string readError = n > 0 ? ReadLogSlice(plan.FilePath, offset, slice, n) : null;
+                if (readError != null)
+                {
+                    if (chunkIndex > 0)
+                    {
+                        // The server's inactivity timeout drops the partial transfer; a delta keeps its prefix.
+                        Debug.LogWarning($"[VAngarde] Log send stopped at chunk {chunkIndex + 1}/{total}: {readError}");
+                        break;
+                    }
+                    // Chunk 0 carries the mod list the server validates: send it with an empty log rather than not at all.
+                    Debug.LogWarning($"[VAngarde] Log read failed ({readError}); sending the challenge response without the log.");
+                    plan = new LogPlan { FilePath = plan.FilePath, Reason = LogReasonReadError };
+                    total = 1;
+                    slice = Array.Empty<byte>();
+                }
+
+                ZPackage pkg = BuildLogRangePackage(nonce, total, chunkIndex, modList, hash, plan, slice, pluginHashes, audit);
+                if (pkg == null || !SafeRoutedRpc.InvokeSafe(serverPeerId, RPC_Response, pkg)) break;
+                sent++;
+
+                // Two frames per chunk, as in SafeRoutedRpc.PacedChunkedSend, so each chunk gets its own socket flush.
+                yield return null;
+                yield return null;
+            }
+
+            if (sent < total)
+                Debug.LogWarning($"[VAngarde] Chunked log send aborted early: {sent}/{total} chunks delivered.");
+        }
+
+        // One v2 chunk package; null (and a warning) if building it threw.
+        private static ZPackage BuildLogRangePackage(string nonce, int total, int chunkIndex,
+            List<KeyValuePair<string, string>> modList, byte[] hash, LogPlan plan, byte[] slice,
+            Dictionary<string, string> pluginHashes, VAngardeModListAudit.Snapshot audit)
+        {
+            try
+            {
+                var pkg = new ZPackage();
+                pkg.Write(nonce);
+                pkg.Write(RangeChunkMarker);
+                pkg.Write(total);
+                pkg.Write(chunkIndex);
+
+                if (chunkIndex == 0)
+                {
+                    pkg.Write(modList.Count);
+                    foreach (var mod in modList)
+                    {
+                        pkg.Write(mod.Key);
+                        pkg.Write(mod.Value);
+                    }
+                    pkg.Write(hash);
+                    pkg.Write(plan.Base);
+                    pkg.Write(plan.End);
+                    pkg.Write(plan.Reason);
+                    pkg.Write(slice);
+                    WriteHardeningTrailer(pkg, nonce, hash, pluginHashes, audit);
+                }
+                else
+                {
+                    pkg.Write(slice);
+                }
+                return pkg;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[VAngarde] Building log chunk {chunkIndex + 1}/{total} failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Reads log[offset, offset + count) into buffer; null on success, else what went wrong. Opened and closed per
+        // chunk, so a stopped send never holds the file.
+        private static string ReadLogSlice(string path, long offset, byte[] buffer, int count)
+        {
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    stream.Position = offset;
+                    if (!ReadFully(stream, buffer, count)) return $"the file ends before {offset + count} B";
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
         }
 
         // ---------------------------------------------------------------------------
@@ -1191,7 +1876,7 @@ namespace VerdantsAscent.Modules.AntiCheat
 
         /// <summary>
         /// Called each server frame to check timeouts and send periodic re-challenges.
-        /// Also cleans up stale chunked log reassembly state.
+        /// Also aborts log transfers that went quiet.
         /// </summary>
         public static void ServerUpdate()
         {
@@ -1210,27 +1895,18 @@ namespace VerdantsAscent.Modules.AntiCheat
             float recheckInterval = (VAngardeConfig.PeriodicRecheckMinutes?.Value ?? 5f) * 60f;
 
             List<PeerState> toDisconnect = null;
-            List<long> staleChunkedLogs = null;
+            List<LogTransfer> staleTransfers = null;
 
             lock (_lock)
             {
-                // Clean up stale chunked log reassembly state
-                foreach (var kvp in _pendingChunkedLogs)
+                // Log transfers with no chunk for LogTransferTimeout seconds (inactivity, not age: a big reset
+                // may take longer in total). Steam sends are reliable, so that is a dead sender; aborted below.
+                foreach (var kvp in _logTransfers)
                 {
-                    if (now - kvp.Value.FirstChunkTime > ChunkedLogTimeout)
+                    if (now - kvp.Value.LastChunkTime > LogTransferTimeout)
                     {
-                        if (staleChunkedLogs == null) staleChunkedLogs = new List<long>();
-                        staleChunkedLogs.Add(kvp.Key);
-                    }
-                }
-
-                if (staleChunkedLogs != null)
-                {
-                    foreach (var peerUid in staleChunkedLogs)
-                    {
-                        var chunkedState = _pendingChunkedLogs[peerUid];
-                        Debug.LogWarning($"[VAngarde] Chunked log timeout for peer {peerUid}: received {chunkedState.Chunks.Count}/{chunkedState.TotalChunks} chunks");
-                        _pendingChunkedLogs.Remove(peerUid);
+                        if (staleTransfers == null) staleTransfers = new List<LogTransfer>();
+                        staleTransfers.Add(kvp.Value);
                     }
                 }
 
@@ -1278,7 +1954,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                     // SendChunkedLogResponse -> SafeRoutedRpc.PacedChunkedSend with
                     // 200 KB chunks + two-frame yields, so logs that have grown past
                     // 400 KB mid-session cannot concatenate past Steam's 524288 B cap.
-                    if (state.Validated && recheckInterval > 0 && now - state.LastChallengeTime > recheckInterval)
+                    //
+                    // 0.2.42: never while a log transfer for this peer is landing - a new
+                    // `have` would race the appends still queued for the disk thread.
+                    if (state.Validated && recheckInterval > 0 && now - state.LastChallengeTime > recheckInterval
+                        && !_logTransfers.ContainsKey(kvp.Key))
                     {
                         if (state.IsValheimAdmin)
                         {
@@ -1291,6 +1971,20 @@ namespace VerdantsAscent.Modules.AntiCheat
                             SendChallenge(state);
                         }
                     }
+                }
+            }
+
+            // Abort the quiet transfers outside the lock: a delta keeps its prefix, a reset drops its temp file.
+            if (staleTransfers != null)
+            {
+                foreach (var transfer in staleTransfers)
+                {
+                    PeerState owner;
+                    lock (_lock)
+                    {
+                        _trackedPeers.TryGetValue(transfer.PeerUid, out owner);
+                    }
+                    AbortLogTransfer(owner, transfer, $"no chunk for {LogTransferTimeout:0} s");
                 }
             }
 
@@ -1312,15 +2006,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                     // Tell the client WHY before the disconnect (shown via FiresConnectReasonPanel).
                     FiresCore.Bridge.FiresConnectReason.Send(peerToKick?.m_rpc, "\uD83D\uDEE1 Disconnected by VAngarde anti-cheat", new[] { reason });
 
-                    DiscordSink.OnAntiCheatKick(playerName, state.PlatformId, reason,
-                        state.ClientModList, state.ClientBepInExLog,
+                    KickWithLog(state, playerName, reason,
                         onComplete: () =>
                         {
                             ForceDisconnect(peerToKick, reason);
-                            lock (_lock)
-                            {
-                                _trackedPeers.Remove(peerUid);
-                            }
+                            ForgetPeer(peerUid, "peer kicked");
                         });
                 }
             }
@@ -1388,6 +2078,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                 return;
             }
 
+            // 0.2.42 review: one kick per peer. The scanner can fire again every 2 s before the disconnect lands; each repeat
+            // would re-read the cached log on the disk thread and post to Discord again.
+            if (state.KickPending) return;
+            state.KickPending = true;
+
             // Notify Discord of the kick - defer the actual disconnect until the webhook
             // upload completes so the mod list and client BepInEx log reach Discord first.
             var peerToKick = state.Peer;
@@ -1400,15 +2095,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                 ? detailLines : new[] { reason };
             FiresCore.Bridge.FiresConnectReason.Send(peerToKick?.m_rpc, "\uD83D\uDEE1 Disconnected by VAngarde anti-cheat", kickLines);
 
-            DiscordSink.OnAntiCheatKick(playerName, state.PlatformId, reason,
-                state.ClientModList, state.ClientBepInExLog,
+            KickWithLog(state, playerName, reason,
                 onComplete: () =>
                 {
                     ForceDisconnect(peerToKick, kickReason);
-                    lock (_lock)
-                    {
-                        _trackedPeers.Remove(peerUid);
-                    }
+                    ForgetPeer(peerUid, "peer kicked");
                 });
         }
 
@@ -1489,6 +2180,9 @@ namespace VerdantsAscent.Modules.AntiCheat
             // Notify Discord - kick (god mode confirmed = always kick, even in log-only mode)
             // Include client mod list and BepInEx log for debugging.
             // Defer the actual disconnect until the webhook upload completes.
+            // 0.2.42 review: one kick per peer (a repeat would re-read the log and post again).
+            if (state.KickPending) return;
+            state.KickPending = true;
             var peerToKick = state.Peer;
             var peerUid = state.Peer.m_uid;
             string kickReason = reason;
@@ -1496,15 +2190,11 @@ namespace VerdantsAscent.Modules.AntiCheat
             // Tell the client WHY before the disconnect (shown via FiresConnectReasonPanel).
             FiresCore.Bridge.FiresConnectReason.Send(peerToKick?.m_rpc, "\uD83D\uDEE1 Disconnected by VAngarde anti-cheat", new[] { reason });
 
-            DiscordSink.OnAntiCheatKick(playerName, state.PlatformId, reason,
-                state.ClientModList, state.ClientBepInExLog,
+            KickWithLog(state, playerName, reason,
                 onComplete: () =>
                 {
                     ForceDisconnect(peerToKick, kickReason);
-                    lock (_lock)
-                    {
-                        _trackedPeers.Remove(peerUid);
-                    }
+                    ForgetPeer(peerUid, "peer kicked");
                 });
         }
 
@@ -1570,6 +2260,11 @@ namespace VerdantsAscent.Modules.AntiCheat
             {
                 Debug.LogWarning($"[VAngarde] Cleanup error: {ex.Message}");
             }
+
+            // 0.2.42: this skips ZNet.Disconnect, so our own disconnect handler never runs. Forget the peer here (tracking,
+            // log transfer, cache-file claim), or a reconnect finds its stale claim and every log transfer is discarded.
+            // A second ForgetPeer for the same uid is a no-op.
+            ForgetPeer(peer.m_uid, "force-disconnected");
         }
 
         // ==============================================================

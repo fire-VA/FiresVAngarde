@@ -155,6 +155,7 @@
     <Compile Include="Modules\VAngarde\VAngardeCore.cs" />
     <Compile Include="Modules\VAngarde\VAngardePatches.cs" />
     <Compile Include="Modules\VAngarde\VAngardeModValidator.cs" />
+    <Compile Include="Modules\VAngarde\VAngardeAdminSuggest.cs" />
     <Compile Include="Modules\VAngarde\VAngardeCheatScanner.cs" />
     <Compile Include="Modules\VAngarde\VAngardeAdminCommandMonitor.cs" />
     <Compile Include="Modules\VAngarde\VAngardeConsoleCommands.cs" />

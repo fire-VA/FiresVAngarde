@@ -27,6 +27,13 @@ namespace VerdantsAscent.Modules.AntiCheat
         public static ConfigEntry<bool> UseExactMatch;
         public static ConfigEntry<bool> AutoUpdateModList;
         public static ConfigEntry<bool> AdminModsExtendWhitelist;
+        public static ConfigEntry<AdminOnlyMode> AdminOnlyListMode;
+
+        /// <summary>What mod_adminonly.txt means (0.2.40, Fire 10-05).</summary>
+        public enum AdminOnlyMode { AdminWhitelist, AdminRequired }
+
+        /// <summary>True when admins must run every admin-only mod (the pre-0.2.40 rule).</summary>
+        public static bool AdminOnlyRequired => AdminOnlyListMode != null && AdminOnlyListMode.Value == AdminOnlyMode.AdminRequired;
 
         // ?????? Challenge / Response ??????
         public static ConfigEntry<float> ChallengeTimeoutSeconds;
@@ -97,10 +104,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                 "Kick players with mods listed in mod_blacklist.txt.");
             UseExactMatch = config.Bind("VAngarde.ModValidation", "UseExactMatch", true,
                 "Require every mod in mod_exactmatch.txt to be present on the client at the exact version " +
-                "(extra client-only mods are allowed). ON by default; with AutoUpdateModList the list tracks " +
+                "(extra client-only mods are allowed), except mods in mod_serveronly.txt (never required of clients) " +
+                "and mods in mod_adminonly.txt (see AdminOnlyListMode). ON by default; with AutoUpdateModList the list tracks " +
                 "the server's own plugins automatically. Set false to disable mod-list enforcement.");
             AutoUpdateModList = config.Bind("VAngarde.ModValidation", "AutoUpdateModList", false,
-                "When ON, the server OVERWRITES mod_whitelist.txt and mod_exactmatch.txt from its loaded " +
+                "When ON, the server OVERWRITES mod_exactmatch.txt from its loaded " +
                 "plugins on EVERY launch. Default OFF so the lists stay stable and grow only when an admin " +
                 "connects with a new mod (see AdminModsExtendWhitelist). Turn ON once to bootstrap the lists " +
                 "on a fresh server, then set it back OFF.");
@@ -108,6 +116,11 @@ namespace VerdantsAscent.Modules.AntiCheat
                 "When an ADMIN (from adminlist.txt) connects, add any mod they're running that isn't already " +
                 "whitelisted to mod_whitelist.txt - admins approve a client mod for everyone just by connecting " +
                 "with it. Server-authoritative (admin status can't be client-spoofed). Pairs with UseWhitelist.");
+            AdminOnlyListMode = config.Bind("VAngarde.ModValidation", "AdminOnlyListMode", AdminOnlyMode.AdminWhitelist,
+                "What mod_adminonly.txt means. AdminWhitelist (default): only admins may run those mods - a player who has one is " +
+                "refused, and an admin is never required to have any; an admin who lacks some gets a popup suggesting them as the " +
+                "world loads (Ignore is remembered until the list changes). AdminRequired: the same, AND an admin who lacks one is " +
+                "refused with the mods to install.");
 
             // ?? Challenge / Response ??
             ChallengeTimeoutSeconds = config.Bind("VAngarde.Timing", "ChallengeTimeoutSeconds", 90f,
@@ -196,6 +209,7 @@ namespace VerdantsAscent.Modules.AntiCheat
             configSync.AddConfigEntry(UseExactMatch);
             configSync.AddConfigEntry(AutoUpdateModList);
             configSync.AddConfigEntry(AdminModsExtendWhitelist);
+            configSync.AddConfigEntry(AdminOnlyListMode);
             configSync.AddConfigEntry(ChallengeTimeoutSeconds);
             configSync.AddConfigEntry(PeriodicRecheckMinutes);
             configSync.AddConfigEntry(EnforceModListAudit);

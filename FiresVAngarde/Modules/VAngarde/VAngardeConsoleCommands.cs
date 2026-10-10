@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using HarmonyLib;
@@ -151,19 +152,28 @@ namespace VerdantsAscent.Modules.AntiCheat
                 return;
             }
 
+            // 0.2.43 ([release]'s how-to research): the whole ID must match. "Contains" kicked the first player whose host name
+            // merely held the typed text, so a partial ID could disconnect the wrong person. A platform prefix ("Steam_") is optional.
             ZNetPeer target = null;
+            var partial = new List<string>();
             foreach (var peer in peers)
             {
-                if (peer.m_socket.GetHostName().Contains(targetId))
+                string host = peer.m_socket.GetHostName() ?? "";
+                int cut = host.LastIndexOf('_');
+                string bare = cut >= 0 ? host.Substring(cut + 1) : host;
+                if (string.Equals(host, targetId, StringComparison.OrdinalIgnoreCase) || string.Equals(bare, targetId, StringComparison.OrdinalIgnoreCase))
                 {
                     target = peer;
                     break;
                 }
+                if (host.IndexOf(targetId, StringComparison.OrdinalIgnoreCase) >= 0) partial.Add(host);
             }
 
             if (target == null)
             {
-                args.Context.AddString($"[VAngarde] No peer found matching '{targetId}'");
+                args.Context.AddString(partial.Count > 0
+                    ? $"[VAngarde] No peer has the exact ID '{targetId}'; nobody kicked. Partial matches: {string.Join(", ", partial)}"
+                    : $"[VAngarde] No peer found matching '{targetId}'");
                 return;
             }
 

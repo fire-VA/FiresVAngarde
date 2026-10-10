@@ -41,6 +41,9 @@ namespace VerdantsAscent.Modules.Characters
             CharactersEmergencyBackup.EnsureServerKey();
             peer.m_rpc.Register<ZPackage>(CharactersEmergencyBackup.RpcCheckSig,
                 CharactersEmergencyBackup.OnServerReceiveSignature);
+            peer.m_rpc.Register<int>(CharactersEmergencyBackup.RpcSigIncoming, CharactersEmergencyBackup.OnServerBackupIncoming);
+            peer.m_rpc.Register<ZPackage>(CharactersEmergencyBackup.RpcCheckSigChunked,
+                CharacterProfileTransport.Receiver(CharactersEmergencyBackup.OnServerReceiveChunkedSignature));
             CharactersEmergencyBackup.SendKeyToPeer(peer);
         }
 
@@ -82,6 +85,18 @@ namespace VerdantsAscent.Modules.Characters
                 pendingWait += Time.unscaledDeltaTime;
                 yield return null;
             }
+
+            // An emergency backup this client announced is restored first, so the profile sent below is the restored one (0.2.38).
+            // Bounded like a transfer: the login goes ahead after NoProgressTimeoutSeconds whatever happens to the backup.
+            float restoreWait = 0f;
+            while (CharactersEmergencyBackup.RestoreInFlight(rpc) && restoreWait < CharactersConfig.NoProgressTimeoutSeconds)
+            {
+                restoreWait += Time.unscaledDeltaTime;
+                yield return null;
+            }
+            if (restoreWait > 0f)
+                Debug.Log($"[Characters] emergency-backup: {steamId}/{name}'s login waited {restoreWait:0.0} s for its backup" +
+                          (CharactersEmergencyBackup.RestoreInFlight(rpc) ? " and went ahead without it." : "."));
 
             if (peer.m_uid != 0L)
             {

@@ -56,7 +56,74 @@ namespace VerdantsAscent.Modules.AntiCheat
         internal static IReadOnlyCollection<string> AdminOnlyGuids => _adminOnly;
 
         /// <summary>Live view of the enforced (exact-match) entries: GUID -> required version.</summary>
-        internal static IReadOnlyDictionary<string, string> ExactMatchEntries => _exactMatch;
+        // What a PLAYER must run (the Discord "Enforced" list): mod_exactmatch.txt minus server-only and admin-only.
+        internal static IReadOnlyDictionary<string, string> ExactMatchEntries =>
+            _exactMatch.Where(kv => NotRequiredBecause(kv.Key, false) == null).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+
+        // The rule (Fire 10-05: "Exact match should just force version numbers and mods that aren't listed in the admin only mods list
+        // or server only list"): exact match requires every listed mod on the client at its version EXCEPT a server-only mod (a client
+        // never needs it) and an admin-only mod (never required of anyone, 0.2.40). The auto-write already leaves both out, but a GUID that
+        // reached mod_exactmatch.txt another way (an admin push, a hand edit, a list written before the mod was marked server-only)
+        // refused every client without it, so every check reads the required set through here. Null = required.
+        private static string NotRequiredBecause(string guid, bool isAdmin)
+        {
+            if (_serverOnly.Contains(guid)) return "server-only (mod_serveronly.txt)";
+            // 0.2.40 (Fire 10-05: "admin only was only ever meant to be 'only admins can use these mods' not 'admins MUST use
+            // these mods'", then: make it a config toggle). AdminOnlyListMode = AdminWhitelist (default): an admin-only mod is never
+            // required of anyone; a non-admin who HAS one is refused by the whitelist check, and an admin who lacks one gets a
+            // suggestion popup (VAngardeAdminSuggest). AdminRequired (the old rule): an admin must run every one of them.
+            if (_adminOnly.Contains(guid))
+            {
+                if (!isAdmin) return "admin-only (mod_adminonly.txt), this client is not an admin";
+                if (!VAngardeConfig.AdminOnlyRequired) return "admin-only (mod_adminonly.txt): suggested to admins, not required (AdminWhitelist)";
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The admin-only mods an admin's client lacks (0.2.40): GUID -> the version the server knows (mod_exactmatch.txt, else the
+        /// server's own loaded plugin, else ""). Suggested to that admin, never required.
+        /// </summary>
+        internal static List<KeyValuePair<string, string>> AdminOnlyMissing(Dictionary<string, string> clientMods)
+        {
+            var missing = new List<KeyValuePair<string, string>>();
+            foreach (var guid in _adminOnly.OrderBy(g => g, StringComparer.OrdinalIgnoreCase))
+                if (clientMods == null || !clientMods.ContainsKey(guid)) missing.Add(new KeyValuePair<string, string>(guid, AdminOnlyVersion(guid)));
+            return missing;
+        }
+
+        // AdminRequired: the admin-only mods this admin lacks that the exact-match pass will not already flag (that pass covers the
+        // ones also in mod_exactmatch.txt while UseExactMatch is on). Empty in AdminWhitelist mode or for a player.
+        private static List<string> AdminRequiredMissing(Dictionary<string, string> clientMods, bool isAdmin)
+        {
+            var missing = new List<string>();
+            if (!isAdmin || !VAngardeConfig.AdminOnlyRequired) return missing;
+            bool exactOn = VAngardeConfig.UseExactMatch != null && VAngardeConfig.UseExactMatch.Value && _exactMatch.Count > 0;
+            foreach (var guid in _adminOnly.OrderBy(g => g, StringComparer.OrdinalIgnoreCase))
+                if (!clientMods.ContainsKey(guid) && !(exactOn && _exactMatch.ContainsKey(guid))) missing.Add(guid);
+            return missing;
+        }
+
+        /// <summary>The server's admin-only list as "GUID=version" lines, sorted: what an admin's "ignore" is keyed by.</summary>
+        internal static string AdminOnlySignature()
+            => string.Join("\n", _adminOnly.OrderBy(g => g, StringComparer.OrdinalIgnoreCase).Select(g => $"{g}={AdminOnlyVersion(g)}").ToArray());
+
+        private static string AdminOnlyVersion(string guid)
+        {
+            if (_exactMatch.TryGetValue(guid, out string v) && !string.IsNullOrEmpty(v)) return v;
+            try
+            {
+                if (BepInEx.Bootstrap.Chainloader.PluginInfos.TryGetValue(guid, out var info) && info?.Metadata != null) return info.Metadata.Version.ToString();
+            }
+            catch { }
+            return "";
+        }
+
+        private static bool Required(string guid, bool isAdmin) => _exactMatch.ContainsKey(guid) && NotRequiredBecause(guid, isAdmin) == null;
+
+        /// <summary>The expected DLL hashes of the mods this client must run (server-only and, for a player, admin-only left out).</summary>
+        internal static IReadOnlyDictionary<string, string> RequiredHashes(bool isAdmin) =>
+            _exactMatchHashes.Where(kv => NotRequiredBecause(kv.Key, isAdmin) == null).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Live view of the whitelisted (allowed-extra) GUIDs.</summary>
         internal static IReadOnlyCollection<string> WhitelistGuids => _whitelist;
@@ -648,15 +715,22 @@ namespace VerdantsAscent.Modules.AntiCheat
         }
 
         /// <summary>
-        /// Save a client's BepInEx LogOutput.log to disk under ClientLogs/{playerName}_{safeId}/LogOutput.log.
-        /// Overwrites on every challenge response so the file always holds the latest log.
-        /// Called server-side whenever a client sends their log in the challenge response.
+        /// Raised on the disk thread when a client-log write fails or finds the cache file not as long as the server
+        /// expects (deleted, edited, an earlier write lost). The next challenge then asks that client for its whole log.
         /// </summary>
-        public static void CacheClientLog(string platformId, string playerName, byte[] logBytes)
+        public sealed class LogDiskFlag
         {
-            if (string.IsNullOrEmpty(platformId) || logBytes == null || logBytes.Length == 0) return;
+            public volatile bool Failed;
+        }
 
-            string filePath;
+        /// <summary>
+        /// Cache path of a client's BepInEx LogOutput.log: ClientLogs/{playerName}_{safeId}/LogOutput.log.
+        /// Null when the id is empty or the path cannot be built.
+        /// </summary>
+        public static string ClientLogPath(string platformId, string playerName)
+        {
+            if (string.IsNullOrEmpty(platformId)) return null;
+
             try
             {
                 string safeId   = platformId.Replace(":", "_").Replace("/", "_").Replace("\\", "_");
@@ -665,37 +739,167 @@ namespace VerdantsAscent.Modules.AntiCheat
                     : string.Concat(playerName.Split(Path.GetInvalidFileNameChars()));
 
                 string dir = Path.Combine(VAngardeConfig.ClientLogsDir, $"{safeName}_{safeId}");
-                filePath = Path.Combine(dir, "LogOutput.log");
+                return Path.Combine(dir, "LogOutput.log");
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[VAngarde] Failed to cache client log for {platformId}: {ex.Message}");
-                return;
+                return null;
             }
-
-            // The write (a few hundred KB, every periodic refresh) runs on the mod's disk thread: on the server's main thread
-            // it sat inside the challenge-response RPC handler, in the frame every relayed PvP hit waits on.
-            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() => WriteClientLog(filePath, logBytes, platformId));
         }
 
-        // Written beside the file and swapped in, so an admin reading the cached log never gets half of one.
-        private static void WriteClientLog(string filePath, byte[] logBytes, string platformId)
-        {
-            try
-            {
-                string dir = Path.GetDirectoryName(filePath);
-                if (!Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
+        // 0.2.42: the client log arrives slice by slice. A delta is appended to the cached file; a reset is written beside
+        // it and swapped in at the end, so an admin reading the cached log never gets half of a reset. Every job runs on
+        // the mod's disk thread in the order queued (never on the server's main thread, inside the challenge-response RPC
+        // handler, in the frame every relayed PvP hit waits on), so a read queued after the appends sees all of them.
 
-                string temp = filePath + ClientLogTempSuffix;
-                File.WriteAllBytes(temp, logBytes);
-                if (File.Exists(filePath)) File.Replace(temp, filePath, null);
-                else File.Move(temp, filePath);
-                LogVerbose($"Cached client log for {platformId} ({logBytes.Length} bytes) to {filePath}");
-            }
-            catch (Exception ex)
+        /// <summary>Start a reset: an empty temp file beside the cached log.</summary>
+        public static void BeginClientLogReset(string path, LogDiskFlag flag)
+        {
+            if (string.IsNullOrEmpty(path) || flag == null) return;
+
+            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() =>
             {
-                Debug.LogWarning($"[VAngarde] Failed to cache client log for {platformId}: {ex.Message}");
+                try
+                {
+                    string dir = Path.GetDirectoryName(path);
+                    if (!Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+                    using (new FileStream(path + ClientLogTempSuffix, FileMode.Create, FileAccess.Write, FileShare.Read)) { }
+                }
+                catch (Exception ex)
+                {
+                    flag.Failed = true;
+                    Debug.LogWarning($"[VAngarde] Failed to start the client log cache {path}: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Append one slice to the cached log (a delta) or to the reset's temp file. The file must be exactly
+        /// expectedOffset bytes long first; anything else fails the flag, and the rest of that transfer is skipped.
+        /// The array is written as handed over, never copied.
+        /// </summary>
+        public static void AppendClientLog(string path, bool intoTemp, byte[] data, long expectedOffset, LogDiskFlag flag)
+        {
+            if (string.IsNullOrEmpty(path) || data == null || data.Length == 0 || flag == null) return;
+
+            string target = intoTemp ? path + ClientLogTempSuffix : path;
+            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() =>
+            {
+                if (flag.Failed) return;
+                try
+                {
+                    var info = new FileInfo(target);
+                    long length = info.Exists ? info.Length : -1;
+                    if (length != expectedOffset)
+                    {
+                        flag.Failed = true;
+                        // Disk thread: UnityEngine.Debug like the rest of this thread's lines (thread-safe), not the BepInEx source.
+                        Debug.LogWarning($"[VAngarde] client log cache {target} is {length} B, expected {expectedOffset} B; the next challenge asks for the whole log");
+                        return;
+                    }
+                    using (var stream = new FileStream(target, FileMode.Append, FileAccess.Write, FileShare.Read))
+                        stream.Write(data, 0, data.Length);
+                }
+                catch (Exception ex)
+                {
+                    flag.Failed = true;
+                    Debug.LogWarning($"[VAngarde] Failed to append to the client log cache {target}: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>Finish a reset: swap the temp file in for the cached log, or drop it when a write failed.</summary>
+        public static void CommitClientLogReset(string path, LogDiskFlag flag, string platformId, long bytes)
+        {
+            if (string.IsNullOrEmpty(path) || flag == null) return;
+
+            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() =>
+            {
+                string temp = path + ClientLogTempSuffix;
+                try
+                {
+                    if (flag.Failed)
+                    {
+                        if (File.Exists(temp)) File.Delete(temp);
+                        return;
+                    }
+                    if (File.Exists(path)) File.Replace(temp, path, null);
+                    else File.Move(temp, path);
+                    LogVerbose($"Cached client log for {platformId} ({bytes} bytes) to {path}");
+                }
+                catch (Exception ex)
+                {
+                    flag.Failed = true;
+                    Debug.LogWarning($"[VAngarde] Failed to cache client log for {platformId}: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>Drop an unfinished reset's temp file; the cached log stays as it was.</summary>
+        public static void AbortClientLogReset(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+
+            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() =>
+            {
+                string temp = path + ClientLogTempSuffix;
+                try
+                {
+                    if (File.Exists(temp)) File.Delete(temp);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[VAngarde] Failed to remove the unfinished client log {temp}: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Read a cached client log on the disk thread, after every write queued before it, then call onRead there
+        /// with the bytes (null when missing or unreadable). onRead is always called.
+        /// </summary>
+        public static void ReadClientLogQueued(string path, Action<byte[]> onRead)
+        {
+            if (onRead == null) return;
+
+            VerdantsAscent.Modules.Characters.CharacterDiskWriter.Enqueue(() =>
+            {
+                byte[] bytes = null;
+                try
+                {
+                    if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                        bytes = ReadSharedAllBytes(path);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[VAngarde] Failed to read cached client log {path}: {ex.Message}");
+                }
+                onRead(bytes);
+            });
+        }
+
+        /// <summary>
+        /// 0.2.42 review: reads a client log cache the disk thread may be appending to. The appender holds write access,
+        /// so the reader must share ReadWrite (File.ReadAllBytes shares Read only: it fails while an append is open, or
+        /// makes the append fail if it opened first). Delete is shared too, so a reset's File.Replace isn't blocked.
+        /// </summary>
+        private static byte[] ReadSharedAllBytes(string path)
+        {
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                long length = stream.Length;
+                var bytes = new byte[length];
+                int read = 0;
+                while (read < length)
+                {
+                    int n = stream.Read(bytes, read, (int)(length - read));
+                    if (n <= 0) break;
+                    read += n;
+                }
+                if (read < length) Array.Resize(ref bytes, read);
+                return bytes;
             }
         }
 
@@ -744,7 +948,7 @@ namespace VerdantsAscent.Modules.AntiCheat
 
             try
             {
-                return File.ReadAllBytes(path);
+                return ReadSharedAllBytes(path);
             }
             catch (Exception ex)
             {
@@ -788,12 +992,20 @@ namespace VerdantsAscent.Modules.AntiCheat
                     "# Format: GUID=Version (one per line).",
                     ""
                 };
+                // Same exclusions as the auto-write (0.2.39): the admin's own server-only and admin-only mods are never required of clients.
+                int skipped = 0;
                 foreach (var kvp in mods.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
                 {
+                    if (_serverOnly.Contains(kvp.Key) || _adminOnly.Contains(kvp.Key))
+                    {
+                        skipped++;
+                        FiresVAngarde.Log?.LogDebug($"[VAngarde] admin push: {kvp.Key}={kvp.Value} left out of mod_exactmatch.txt ({(_serverOnly.Contains(kvp.Key) ? "server-only" : "admin-only")})");
+                        continue;
+                    }
                     exactLines.Add($"{kvp.Key}={kvp.Value}");
                 }
                 File.WriteAllLines(VAngardeConfig.ExactMatchPath, exactLines.ToArray());
-                Debug.Log($"[VAngarde] Exact match list overwritten by admin {adminPlatformId} ({mods.Count} entries)");
+                Debug.Log($"[VAngarde] Exact match list overwritten by admin {adminPlatformId} ({mods.Count - skipped} entries, {skipped} server-only/admin-only left out)");
 
                 // Also cache the admin's mod list
                 CacheAdminModList(adminPlatformId, mods);
@@ -865,12 +1077,17 @@ namespace VerdantsAscent.Modules.AntiCheat
             {
                 foreach (var required in _exactMatch)
                 {
+                    if (NotRequiredBecause(required.Key, isAdmin) != null) continue;
                     if (!clientMods.TryGetValue(required.Key, out string clientVersion))
                         return $"Required mod missing: {required.Key}";
                     if (!string.Equals(clientVersion, required.Value, StringComparison.OrdinalIgnoreCase))
                         return $"Version mismatch for {required.Key}: expected {required.Value}, got {clientVersion}";
                 }
             }
+
+            // -- AdminOnlyListMode = AdminRequired: an admin must run every admin-only mod --
+            var adminMissing = AdminRequiredMissing(clientMods, isAdmin);
+            if (adminMissing.Count > 0) return $"Required mod missing: {adminMissing[0]} (admin-only, AdminRequired)";
 
             // -- Whitelist - every EXTRA client mod must be explicitly allowed --
             // A client mod passes if it is required (exact-match), an admin-only mod on an ADMIN client, an
@@ -879,16 +1096,17 @@ namespace VerdantsAscent.Modules.AntiCheat
             // outcome). Admin-only is checked BEFORE the whitelist because it OVERRIDES it - a non-admin
             // with an admin-only mod is rejected even if the GUID was also hand-added to the whitelist.
             // Anything else is an unlisted mod = a potential injected cheat, and is rejected.
+            // 0.2.40 (Fire: "only admins can use these mods"): a non-admin with an admin-only mod is refused WHATEVER UseWhitelist
+            // says; UseWhitelist only governs the mods outside the admin-only list.
+            if (!isAdmin)
+                foreach (var mod in clientMods)
+                    if (_adminOnly.Contains(mod.Key)) return $"Admin-only mod detected: {mod.Key}";
             if (VAngardeConfig.UseWhitelist != null && VAngardeConfig.UseWhitelist.Value)
             {
                 foreach (var mod in clientMods)
                 {
-                    if (_exactMatch.ContainsKey(mod.Key)) continue;
-                    if (_adminOnly.Contains(mod.Key))
-                    {
-                        if (isAdmin) continue;
-                        return $"Admin-only mod detected: {mod.Key}";
-                    }
+                    if (Required(mod.Key, isAdmin)) continue;
+                    if (_adminOnly.Contains(mod.Key)) continue;   // admins may; a player was refused above
                     if (_whitelist.Contains(mod.Key)) continue;
                     if (_serverOnly.Contains(mod.Key)) continue;
                     return $"Mod not allowed (add to mod_whitelist.txt if legit): {mod.Key}";
@@ -918,15 +1136,15 @@ namespace VerdantsAscent.Modules.AntiCheat
             // (whitelist), or a server-only mod. Admin-only overrides the whitelist. NO Count>0 gate - an
             // empty whitelist still enforces, so a client mod in none of the lists is flagged as
             // unlisted/injected.
+            // 0.2.40: admin-only is refused for a player whatever UseWhitelist says (the whitelist governs only the other mods).
+            if (!isAdmin)
+                foreach (var mod in clientMods.OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase))
+                    if (_adminOnly.Contains(mod.Key)) problems.Add($"REMOVE (admin-only): {mod.Key} ({mod.Value})");
             if (VAngardeConfig.UseWhitelist != null && VAngardeConfig.UseWhitelist.Value)
                 foreach (var mod in clientMods.OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (_exactMatch.ContainsKey(mod.Key)) continue;
-                    if (_adminOnly.Contains(mod.Key))
-                    {
-                        if (!isAdmin) problems.Add($"REMOVE (admin-only): {mod.Key} ({mod.Value})");
-                        continue;
-                    }
+                    if (Required(mod.Key, isAdmin)) continue;
+                    if (_adminOnly.Contains(mod.Key)) continue;   // admins may; a player is flagged above
                     if (_whitelist.Contains(mod.Key)) continue;
                     if (_serverOnly.Contains(mod.Key)) continue;
                     problems.Add($"REMOVE (not allowed): {mod.Key} ({mod.Value})");
@@ -935,11 +1153,28 @@ namespace VerdantsAscent.Modules.AntiCheat
             if (VAngardeConfig.UseExactMatch != null && VAngardeConfig.UseExactMatch.Value && _exactMatch.Count > 0)
                 foreach (var required in _exactMatch.OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (!clientMods.TryGetValue(required.Key, out string clientVersion))
+                    // Debug evidence (0.2.39): every listed mod, required or skipped, with what this client has.
+                    bool has = clientMods.TryGetValue(required.Key, out string clientVersion);
+                    string skip = NotRequiredBecause(required.Key, isAdmin);
+                    if (skip != null)
+                    {
+                        FiresVAngarde.Log?.LogDebug($"[VAngarde] exact-match check: skip {required.Key}={required.Value}: {skip} (client has {(has ? clientVersion : "none")})");
+                        continue;
+                    }
+                    if (!has)
                         problems.Add($"INSTALL: {required.Key} (v{required.Value})");
                     else if (!string.Equals(clientVersion, required.Value, StringComparison.OrdinalIgnoreCase))
                         problems.Add($"UPDATE: {required.Key}  {clientVersion} -> {required.Value}");
+                    FiresVAngarde.Log?.LogDebug($"[VAngarde] exact-match check: required {required.Key}={required.Value}: client has "
+                        + (!has ? "none -> INSTALL" : string.Equals(clientVersion, required.Value, StringComparison.OrdinalIgnoreCase) ? $"{clientVersion} -> ok" : $"{clientVersion} -> UPDATE"));
                 }
+
+            foreach (var guid in AdminRequiredMissing(clientMods, isAdmin))
+            {
+                string v = AdminOnlyVersion(guid);
+                problems.Add(string.IsNullOrEmpty(v) ? $"INSTALL: {guid} (admin-only)" : $"INSTALL: {guid} (v{v}, admin-only)");
+                FiresVAngarde.Log?.LogDebug($"[VAngarde] admin-only check (AdminRequired): required {guid}: client has none -> INSTALL");
+            }
 
             return problems;
         }
@@ -971,6 +1206,8 @@ namespace VerdantsAscent.Modules.AntiCheat
 
             foreach (var req in _exactMatch)
             {
+                // Not required of this client (server-only, or admin-only on a player): a row only if the client has it, as an extra below.
+                if (NotRequiredBecause(req.Key, isAdmin) != null) continue;
                 // seen is populated UNCONDITIONALLY even when the version authority is off, because both
                 // validators exempt a required GUID from the whitelist check without consulting
                 // UseExactMatch. Skipping this when exactOn is false would push required mods through the
@@ -986,16 +1223,21 @@ namespace VerdantsAscent.Modules.AntiCheat
                     : (string.Equals(cv, req.Value, StringComparison.OrdinalIgnoreCase) ? "OK" : "UPDATE");
                 recs.Add((status, req.Key, has ? cv : "", req.Value));
             }
+            foreach (var guid in AdminRequiredMissing(clientMods, isAdmin))
+            {
+                seen.Add(guid);
+                recs.Add(("MISSING", guid, "", AdminOnlyVersion(guid)));
+            }
             foreach (var mod in clientMods)
             {
                 if (seen.Contains(mod.Key)) continue;
                 // Admin-only outranks the whitelist (same precedence as the validators): a non-admin with
                 // one gets the red ADMINONLY tag; an admin sees it as an allowed admin perk. Both validators
-                // check admin-only INSIDE the UseWhitelist gate, so it is not enforced on its own either.
+                // 0.2.40: admin-only is enforced on its own, whatever UseWhitelist says (as both validators now do).
                 string status;
                 if (blacklistOn && _blacklist.Contains(mod.Key)) status = "BANNED";
-                else if (!whitelistOn) status = "ALLOWED";
                 else if (_adminOnly.Contains(mod.Key)) status = isAdmin ? "ADMINOK" : "ADMINONLY";
+                else if (!whitelistOn) status = "ALLOWED";
                 else if (_whitelist.Contains(mod.Key)) status = "ALLOWED";
                 else if (_serverOnly.Contains(mod.Key)) status = "SERVERONLY";
                 else status = "NOTALLOWED";
@@ -1026,8 +1268,8 @@ namespace VerdantsAscent.Modules.AntiCheat
                 var lines = File.ReadAllLines(path);
                 foreach (var raw in lines)
                 {
-                    var line = raw.Trim();
-                    if (string.IsNullOrEmpty(line) || line.StartsWith("#"))
+                    var line = WithoutComment(raw);
+                    if (string.IsNullOrEmpty(line))
                         continue;
                     set.Add(line);
                 }
@@ -1054,8 +1296,8 @@ namespace VerdantsAscent.Modules.AntiCheat
                 var lines = File.ReadAllLines(path);
                 foreach (var raw in lines)
                 {
-                    var line = raw.Trim();
-                    if (string.IsNullOrEmpty(line) || line.StartsWith("#"))
+                    var line = WithoutComment(raw);
+                    if (string.IsNullOrEmpty(line))
                         continue;
 
                     var eqIdx = line.IndexOf('=');
@@ -1085,6 +1327,15 @@ namespace VerdantsAscent.Modules.AntiCheat
             {
                 Debug.LogWarning($"[VAngarde] Failed to load exact match list: {ex.Message}");
             }
+        }
+
+        // One list line without its comment (0.2.39): "expand_world_prefabs  # server side" was stored whole and never matched the
+        // GUID. A GUID or version has no '#', so everything from the first '#' on is a comment.
+        private static string WithoutComment(string raw)
+        {
+            if (raw == null) return "";
+            int hash = raw.IndexOf('#');
+            return (hash >= 0 ? raw.Substring(0, hash) : raw).Trim();
         }
 
         private static void LogVerbose(string msg)
